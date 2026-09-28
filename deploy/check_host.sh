@@ -32,9 +32,18 @@ total_gb=$(awk '/MemTotal/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
 avail_gb=$(( $(mem_available_mib) / 1024 ))
 echo "  total ${total_gb} GB, available ${avail_gb} GB; ${QUANT} needs ~${model_gb} GB + KV cache + prompt cache"
 need_gb=$(( model_gb + 16 + CACHE_RAM_MIB / 1024 ))
+streaming_needed=0
 if (( avail_gb >= need_gb )); then ok "enough RAM for one copy (~${need_gb} GB)"
 elif (( avail_gb >= model_gb + 8 )); then warn "tight: lower CACHE_RAM_MIB / PARALLEL * CTX_PER_SLOT"
-else bad "not enough RAM for ${QUANT} (~${model_gb} GB); use a smaller quant or a bigger server"; fi
+elif [[ "$EXPERT_STREAMING" == off ]]; then
+    bad "not enough RAM for ${QUANT} (~${model_gb} GB) and EXPERT_STREAMING=off"
+elif (( avail_gb < 24 )); then
+    bad "only ${avail_gb} GB available: too little even for streaming experts from SSD (need 24+ GB)"
+else
+    streaming_needed=1
+    warn "model is larger than RAM: experts will stream from SSD (EXPERT_STREAMING), expect a few tok/s"
+    echo "         (~$(( (avail_gb - 12) * 100 / model_gb ))% of the model fits in the page cache; see docs/PLAN.md section 12)"
+fi
 
 nodes=$(numa_nodes | wc -l)
 if (( nodes > 1 )); then
@@ -76,6 +85,23 @@ memlock=$(ulimit -l)
 
 echo "== Disk"
 mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+dev=$(df --output=source "$INSTALL_DIR" 2>/dev/null | tail -n1)
+if command -v lsblk >/dev/null && [[ "$dev" == /dev/* ]]; then
+    # Bus and rotational flag live on the whole disk, not on the partition.
+    disk="$dev"
+    parent=$(lsblk -ndo PKNAME "$dev" 2>/dev/null || true)
+    [[ -n "$parent" ]] && disk="/dev/$parent"
+    rota="" tran=""
+    read -r rota tran < <(lsblk -ndo ROTA,TRAN "$disk" 2>/dev/null || true)
+    [[ -z "$tran" && "$disk" == /dev/vd* ]] && tran=virtio
+    echo "  $INSTALL_DIR is on $dev (bus: ${tran:-unknown}, rotational: ${rota:-unknown})"
+    if (( streaming_needed )); then
+        if [[ "$tran" == nvme ]]; then ok "NVMe SSD for expert streaming"
+        elif [[ "$tran" == virtio ]]; then warn "virtual disk: expert streaming speed depends on the host storage"
+        elif [[ "$rota" == 1 ]]; then bad "expert streaming needs an SSD; this is a spinning disk"
+        else warn "not NVMe: expert streaming from SATA (~0.5 GB/s) will be very slow"; fi
+    fi
+fi
 disk_gb=$(df -BG --output=avail "$INSTALL_DIR" 2>/dev/null | tail -n1 | tr -dc 0-9)
 if [[ -f "$MODEL_DIR/.download-complete-$QUANT" ]]; then ok "model ${QUANT} already downloaded"
 elif (( ${disk_gb:-0} >= model_gb + 10 )); then ok "${disk_gb} GB free in $INSTALL_DIR"

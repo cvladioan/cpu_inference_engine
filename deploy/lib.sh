@@ -30,7 +30,7 @@ load_config() {
 declare -A __ENV_OVERRIDES=()
 for __var in INSTALL_DIR IK_LLAMA_REPO IK_LLAMA_COMMIT HF_REPO QUANT MODEL_DIR MODEL_FILE \
     MODEL_ALIAS HOST PORT API_KEY API_KEY_FILE NUMA_MODE THREADS PARALLEL CTX_PER_SLOT CACHE_RAM_MIB \
-    MLOCK SPEC_TYPE EXTRA_ARGS; do
+    MLOCK EXPERT_STREAMING SPEC_TYPE EXTRA_ARGS; do
     if [[ -n "${!__var+x}" ]]; then
         __ENV_OVERRIDES[$__var]="${!__var}"
     fi
@@ -93,13 +93,34 @@ model_size_mib() {
     fi
 }
 
+# Resolve EXPERT_STREAMING=auto into on or off: on when the model does not fit
+# in available RAM next to the prompt cache and some headroom.
+resolve_streaming() {
+    case "$EXPERT_STREAMING" in
+        on|off) echo "$EXPERT_STREAMING"; return ;;
+        auto) ;;
+        *) die "EXPERT_STREAMING must be auto, on or off (got '$EXPERT_STREAMING')" ;;
+    esac
+    local model_mib
+    model_mib=$(model_size_mib "$(resolve_model)")
+    if (( $(mem_available_mib) < model_mib + CACHE_RAM_MIB + 8192 )); then
+        echo on
+    else
+        echo off
+    fi
+}
+
 # Resolve NUMA_MODE=auto into none, interleave or per-node for this machine.
+# Pass the resolved streaming mode (on/off) as $1.
 resolve_numa_mode() {
+    local streaming="${1:-off}"
     local mode="$NUMA_MODE" nodes model_mib n
     nodes=$(numa_nodes | wc -l)
     if [[ "$mode" == auto ]]; then
         if (( nodes <= 1 )); then
             mode=none
+        elif [[ "$streaming" == on ]]; then
+            mode=interleave
         else
             mode=per-node
             model_mib=$(model_size_mib "$(resolve_model)")
@@ -115,6 +136,9 @@ resolve_numa_mode() {
         none|interleave|per-node) ;;
         *) die "NUMA_MODE must be auto, none, interleave or per-node (got '$mode')" ;;
     esac
+    if [[ "$mode" == per-node && "$streaming" == on ]]; then
+        die "NUMA_MODE=per-node keeps a full copy per node in RAM; it cannot be combined with expert streaming"
+    fi
     if [[ "$mode" != none ]] && (( nodes > 1 )) && ! command -v numactl >/dev/null; then
         die "NUMA_MODE=$mode needs numactl (apt install numactl / dnf install numactl)"
     fi
@@ -122,9 +146,10 @@ resolve_numa_mode() {
 }
 
 # Fill PLACEMENT_PREFIX (command prefix) and PLACEMENT_ARGS (llama.cpp args) for
-# running on NUMA node $2 under mode $1, plus RUN_THREADS.
+# running on NUMA node $2 under mode $1 with expert streaming $3 (on/off),
+# plus RUN_THREADS.
 placement() {
-    local mode="$1" node="${2:-0}"
+    local mode="$1" node="${2:-0}" streaming="${3:-off}"
     PLACEMENT_PREFIX=()
     PLACEMENT_ARGS=()
     case "$mode" in
@@ -145,4 +170,13 @@ placement() {
             RUN_THREADS=${THREADS:-$(physical_cores "$node")}
             ;;
     esac
+    if [[ "$streaming" == on ]]; then
+        # Experts must stay file-backed (mmap) so the page cache can evict and
+        # re-read them; dense weights are still loaded up front.
+        local keep=() a
+        for a in "${PLACEMENT_ARGS[@]}"; do
+            [[ "$a" == --no-mmap ]] || keep+=("$a")
+        done
+        PLACEMENT_ARGS=("${keep[@]}" --defer-experts --prefetch-experts)
+    fi
 }

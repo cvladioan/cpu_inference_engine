@@ -456,7 +456,114 @@ tests/      kernel, golden-layer, end-to-end KL and eval tests
 | DRAM cost and availability; Venice and Diamond Rapids timing | Budget and schedule | Size RAM to the chosen model (768 GB is enough for V4-Flash and 122B); design for AVX-512 + AMX today |
 | Long context on CPU (128K and more) | Attention cost dominates | Architectures that compress attention (V4 CSA/HCA, Qwen3.5 DeltaNet) help; cap context in v1; sparse-attention kernels |
 
-## 12. Sources
+## 12. SSD as a memory tier
+
+**Idea:** keep the model on NVMe and use RAM as a cache for it, so a machine
+can run a model larger than its RAM.
+
+**Why it can work: MoE sparsity.**
+- Each DeepSeek-V4-Flash token uses 6 of 256 experts per layer, about 3.5 GB
+  of about 150 GB of expert weights.
+- Keep the dense weights (about 4-7 GB) and the frequently used experts in
+  RAM, and only cache misses go to the SSD.
+- For a dense model every token reads every weight, so an SSD tier makes it
+  unusably slow.
+
+**Why it is not free: bandwidth.**
+
+| Tier | Bandwidth |
+|---|---|
+| Server DRAM | 450-1,300 GB/s per socket |
+| Desktop DRAM (2 channels) | 60-100 GB/s |
+| NVMe PCIe 4.0 x4 | about 7 GB/s |
+| NVMe PCIe 5.0 x4 | about 14 GB/s |
+
+The SSD is a capacity tier, not a speed tier. The speed of SSD streaming
+depends on:
+- the cache hit rate
+- how well SSD reads overlap with compute
+
+The hit rate comes from routing skew and locality, and it has to be measured
+on real traffic.
+
+**Desktop estimate** (`python3 tools/roofline.py`):
+- DeepSeek-V4-Flash at 4-bit on 2-channel DDR5-6000, no overlap of reads and
+  compute.
+- 64 GB of RAM caches about 31% of the experts; 128 GB caches about 72%.
+
+| SSD | 30% hit | 50% hit | 70% hit | 90% hit |
+|---|---|---|---|---|
+| PCIe 4.0 x4 | 1.7 tok/s | 2.1 | 2.7 | 3.8 |
+| PCIe 5.0 x4 | 2.8 | 3.2 | 3.7 | 4.3 |
+| 2x PCIe 5.0 RAID0 | 4.1 | 4.2 | 4.5 | 4.7 |
+| All in RAM (reference) | 4.8 | 4.8 | 4.8 | 4.8 |
+
+On a desktop, dual-channel RAM is the main limit even with everything in
+RAM. A fast SSD costs roughly 1.2-3x on top of that. That is fine for
+testing, but slow for daily use.
+
+**What exists today:** ik_llama.cpp has the basic mechanism, and
+`deploy/serve.sh` enables it automatically when the model does not fit in RAM
+(`EXPERT_STREAMING`):
+- `--defer-experts` loads dense weights up front and leaves expert tensors
+  memory-mapped, so the OS page cache holds recently used experts.
+- `--prefetch-experts` starts threaded reads of a layer's selected experts as
+  soon as the router has chosen them. During prompt processing it marks the
+  streamed pages cold, so they don't push out the experts decode keeps
+  reusing.
+
+**Measured here:** a 20 GB toy MoE model on a VM with 15 GB of RAM and a
+virtual disk. The numbers are not representative of DeepSeek; they show the
+mechanism works.
+- The server was ready in 4 s. 0.4 GB of dense weights loaded; 18.75 GB of
+  experts stayed deferred.
+- The first request took 9.7 s to the first token and generated 5.7 tok/s
+  (cold cache). The second took 0.14 s and generated 16.4 tok/s.
+- **Prompt processing reads nearly every expert per batch.** Raising the
+  prompt batch from 128 to 1024 tokens made prompt processing 5.5x faster
+  (17 to 95 tok/s). `serve.sh` therefore uses 2048-token batches when
+  streaming.
+
+**What a "smart memory" engine would add**, in order of expected value:
+
+1. **Predictive prefetch.** Today reads start once the current layer has
+   routed, which leaves little time to hide SSD latency. Applying the next
+   layers' routers to the current hidden state predicts their experts about
+   one layer early. Published MoE-offloading work reports this prediction is
+   mostly right. Reads then overlap with compute, which is worth up to about
+   2x in the SSD-bound rows of the table.
+2. **An expert-aware cache instead of the kernel's LRU.**
+   - Pin the dense weights and the hottest experts, measured per workload.
+   - Evict by frequency rather than recency.
+   - Keep prompt-processing sweeps from pushing out the experts decode reuses.
+3. **An I/O path built for experts.**
+   - One contiguous extent per expert per layer.
+   - `O_DIRECT` + io_uring with deep queues.
+   - Striping across several NVMe drives. SSD bandwidth adds up linearly, and
+     servers have PCIe lanes for 4-8 drives.
+4. **Tiered precision.** Store cold experts at lower bit widths (fewer bytes
+   from the SSD) and hot ones at native precision, behind the section 9
+   quality gates.
+5. **SSD-aware scheduling.**
+   - Large prompt batches.
+   - Low concurrency.
+   - No speculative decoding in streaming mode: verifying several tokens
+     touches more distinct experts, which means more SSD reads.
+
+**Where it fits:**
+- Developer desktops, and trying out models larger than RAM.
+- Servers where the model is larger than affordable RAM, for example V4-Pro
+  (1.6T) or V3.x/R1 (671B) on a 256-512 GB server with an NVMe array.
+- For production serving of V4-Flash, RAM remains the right place. 256-768 GB
+  of DDR5 costs less than the throughput streaming loses.
+
+**Next experiment:**
+- Log routed expert IDs on real V4-Flash traffic. The hit rate vs. cache size
+  curve is the one number that decides how useful this is.
+- Then prototype predictive prefetch inside ik_llama.cpp, where it could be
+  contributed upstream, before building any of it into our own engine.
+
+## 13. Sources
 
 - DeepSeek-V4-Flash model card, 284B/13B, CSA/HCA, mHC:
   <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash>
@@ -473,6 +580,8 @@ tests/      kernel, golden-layer, end-to-end KL and eval tests
   <https://github.com/ikawrakow/ik_llama.cpp> and
   <https://github.com/ikawrakow/ik_llama.cpp/pull/2165>
 - llama.cpp DeepSeek-V4 support: <https://github.com/ggml-org/llama.cpp/pull/24162>
+- ik_llama.cpp expert streaming (`--defer-experts`, `--prefetch-experts`):
+  <https://github.com/ikawrakow/ik_llama.cpp/blob/main/ggml/src/ggml-moe-prefetch.h>
 - SGLang CPU backend on Xeon 6 (DeepSeek-R1, AMX):
   <https://www.lmsys.org/blog/2025-07-14-intel-xeon-optimization/>
 - KTransformers, kt-kernel, V4-Flash tutorial:

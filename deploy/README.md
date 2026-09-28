@@ -29,6 +29,9 @@ OpenAI-compatible API with streaming, tool calling and reasoning output. See
   more is comfortable.
   - On a 2-socket server, the fastest mode (`per-node`) keeps a full copy on
     each socket, so each socket needs about 180 GB.
+  - With less RAM, experts are streamed from an NVMe SSD instead (32 GB of
+    RAM minimum, 64 GB or more recommended). This is much slower; see
+    [Test on a desktop PC](#test-on-a-desktop-pc).
 - **Disk:** about 175 GB free for the model. Use NVMe: load time is disk
   bound.
 - **Software:** Linux, git, cmake ≥ 3.14, gcc or clang with C++17, and
@@ -60,6 +63,63 @@ python3 deploy/smoke_test.py --fixed-length --concurrency 4   # four users at on
 Add `--api-key <key>` once you have set `API_KEY`.
 
 Loading takes a few minutes: 160 GB is read from disk into RAM.
+
+## Test on a desktop PC
+
+A desktop can run the full model by streaming experts from the SSD. It is
+good for trying things out, not for serving users.
+
+**What you need:**
+- Linux, or Windows with WSL2.
+- 32 GB of RAM or more; 64 GB or more is much better.
+- An NVMe SSD with about 170 GB free.
+
+**What to expect:** roughly 2-4 tok/s once warm; the first request is slow
+while the cache fills. Even with everything in RAM, a 2-channel desktop tops
+out around 5 tok/s on this model (details in `docs/PLAN.md` section 12).
+Long prompts are slow because every prompt batch reads most experts from the
+SSD.
+
+**Settings.** Put these in `deploy/config.env`:
+
+```bash
+INSTALL_DIR=$HOME/deepseek-cpu   # on the NVMe drive
+QUANT=UD-Q4_K_XL                 # fewer bytes per token than UD-Q8_K_XL
+PARALLEL=1
+CTX_PER_SLOT=16384
+CACHE_RAM_MIB=2048
+EXPERT_STREAMING=auto            # turns on by itself when the model is larger than RAM
+```
+
+Then follow the Quick start. `check_host.sh` warns instead of failing when
+the model is larger than RAM, and checks that the model directory is on
+NVMe. `serve.sh --plan` shows `EXPERT_STREAMING=on`.
+
+**Check streaming before the 160 GB download.** Generate a fake MoE model
+somewhat larger than your RAM and serve it:
+
+```bash
+python3 deploy/test/make_tiny_gguf.py --size-gb 80 ~/moe-test.gguf   # e.g. 80 GB for a 64 GB PC
+MODEL_FILE=~/moe-test.gguf deploy/serve.sh
+```
+
+In a second terminal:
+
+```bash
+python3 deploy/smoke_test.py --fixed-length   # run twice: cold, then warm
+```
+
+Delete `~/moe-test.gguf` afterwards.
+
+**WSL2 notes:**
+- Keep `INSTALL_DIR` on the Linux filesystem (for example `~/deepseek-cpu`),
+  not under `/mnt/c`: Windows drives are mounted through a slow file-sharing
+  layer.
+- WSL2 gets only half of your RAM by default. Raise the limit with
+  `memory=` in `%UserProfile%\.wslconfig`, then run `wsl --shutdown`.
+
+**macOS:** these scripts are Linux-only. On a Mac, use mainline llama.cpp,
+which has a Metal GPU backend.
 
 ## Run it as a service
 
@@ -126,6 +186,7 @@ for a single run, for example `PARALLEL=8 deploy/serve.sh`.
 | `PARALLEL` | `4` | Concurrent requests per server. More gives more total throughput but a slower stream per user (table in `docs/PLAN.md` section 8). |
 | `CTX_PER_SLOT` | `32768` | Longest conversation per request. The total context is `PARALLEL x CTX_PER_SLOT`. |
 | `CACHE_RAM_MIB` | `32768` | RAM for reusing earlier prompts, which lowers time to first token for chats and agents. Raise it if RAM allows. |
+| `EXPERT_STREAMING` | `auto` | `auto` streams experts from SSD only when the model does not fit in RAM. `off` always loads the whole model into RAM, which fails or swaps if it does not fit; `on` forces streaming. |
 | `THREADS` | physical cores | Leave empty unless benchmarks say otherwise; never count hyperthreads. |
 | `SPEC_TYPE` | off | Try `mtp:n_max=1` (speculative decoding with the model's built-in draft head). Keep it only if `smoke_test.py` shows higher tok/s. |
 | `EXTRA_ARGS` | none | Any extra `llama-server` flag, such as `-rtr` (repack weights at load; may speed up prompt processing). Measure with `bench.sh` first. |

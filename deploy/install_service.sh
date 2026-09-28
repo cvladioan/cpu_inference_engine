@@ -13,16 +13,18 @@ load_config
 user="${1:-${SUDO_USER:-root}}"
 repo_dir="$(cd "$DEPLOY_DIR/.." && pwd)"
 
-plan=$(sudo -u "$user" env NUMA_MODE="$NUMA_MODE" "$DEPLOY_DIR/serve.sh" --plan)
+plan=$(sudo -u "$user" env NUMA_MODE="$NUMA_MODE" EXPERT_STREAMING="$EXPERT_STREAMING" \
+    "$DEPLOY_DIR/serve.sh" --plan)
 mode=$(sed -n 's/^NUMA_MODE=//p' <<<"$plan")
+streaming=$(sed -n 's/^EXPERT_STREAMING=//p' <<<"$plan")
 read -r -a instances <<<"$(sed -n 's/^INSTANCES=//p' <<<"$plan")"
-log "NUMA mode: $mode, instances: ${instances[*]}"
+log "NUMA mode: $mode, expert streaming: $streaming, instances: ${instances[*]}"
 
 unit=/etc/systemd/system/deepseek-cpu@.service
 sed -e "s|@REPO_DIR@|$repo_dir|g" -e "s|@USER@|$user|g" \
     "$DEPLOY_DIR/systemd/deepseek-cpu@.service" >"$unit"
 mkdir -p /etc/systemd/system/deepseek-cpu@.service.d
-printf '[Service]\nEnvironment=NUMA_MODE=%s\n' "$mode" \
+printf '[Service]\nEnvironment=NUMA_MODE=%s\nEnvironment=EXPERT_STREAMING=%s\n' "$mode" "$streaming" \
     >/etc/systemd/system/deepseek-cpu@.service.d/numa.conf
 systemctl daemon-reload
 

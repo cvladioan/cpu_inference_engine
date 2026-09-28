@@ -194,6 +194,46 @@ def main():
         rows.append([mm.name] + [f"{t * 1e12 / (2 * mm.active_b * 1e9):.0f}" for t in (10, 25, 50, 100)])
     print(md_table(["model", "10 TOPS eff.", "25", "50", "100"], rows))
 
+    print_ssd_streaming(args)
+
+
+def ssd_stream_tps(m: Model, bits: tuple, ram_gbs: float, ssd_gbs: float, hit: float) -> float:
+    """Single-stream decode tok/s when routed experts live on SSD with a RAM cache.
+
+    Dense weights are RAM-resident; a fraction `hit` of routed-expert bytes comes
+    from the RAM cache, the rest from SSD. Assumes no overlap of SSD reads with
+    compute (prefetching can hide part of it), so this is the conservative case.
+    """
+    be, bd = bits
+    dense = m.dense_stream_b * bd / 8
+    routed = m.routed_active_b * be / 8
+    t = (dense + hit * routed) / ram_gbs + (1 - hit) * routed / ssd_gbs
+    return 1 / t
+
+
+def print_ssd_streaming(args):
+    m, bits = MODELS["dsv4-flash"], PRECISIONS["q4"]
+    expert_gb = m.expert_total_b * bits[0] / 8
+    dense_gb = (m.total_b - m.expert_total_b) * bits[1] / 8
+    # Dual-channel DDR5-6000 desktop; `eff` share of sustained bandwidth.
+    ram = Hardware("desktop, 2ch DDR5-6000", 2, 6000).sustained_gbs(args.stream_frac) * args.eff_today
+    print(f"\n## SSD expert streaming: DeepSeek-V4-Flash 4-bit ({dense_gb + expert_gb:.0f} GB) on a desktop "
+          f"(2ch DDR5-6000, {ram:.0f} GB/s effective)\n")
+    print("Expert cache = RAM minus ~12 GB (OS, KV cache) minus the dense weights. Uniform routing would give a hit")
+    print("rate equal to the cache fraction; real routing is skewed, so measure it.\n")
+    rows = []
+    for ram_gb in (32, 64, 96, 128):
+        cache = max(0.0, min(1.0, (ram_gb - 12 - dense_gb) / expert_gb))
+        rows.append([f"{ram_gb} GB", f"{cache:.0%}"])
+    print(md_table(["RAM", "share of experts cached"], rows))
+    print()
+    # NVMe read speed for multi-MB expert chunks, ~80% of sequential.
+    ssds = [("PCIe 4.0 x4 (~7 GB/s)", 5.6), ("PCIe 5.0 x4 (~14 GB/s)", 11.2), ("2x PCIe 5.0 RAID0", 22.4)]
+    hits = (0.3, 0.5, 0.7, 0.9)
+    rows = [[name] + [f"{ssd_stream_tps(m, bits, ram, bw, h):.1f}" for h in hits] for name, bw in ssds]
+    rows.append(["all in RAM (reference)"] + [f"{ssd_stream_tps(m, bits, ram, 1e9, 1.0):.1f}"] * len(hits))
+    print(md_table(["SSD"] + [f"tok/s at {h:.0%} hit" for h in hits], rows))
+
 
 if __name__ == "__main__":
     main()

@@ -20,7 +20,8 @@ while (( $# )); do
 done
 
 model=$(resolve_model)
-mode=$(resolve_numa_mode)
+streaming=$(resolve_streaming)
+mode=$(resolve_numa_mode "$streaming")
 if [[ "$mode" == per-node ]]; then
     mapfile -t instances < <(numa_nodes)
 else
@@ -29,6 +30,7 @@ fi
 
 if (( plan )); then
     echo "NUMA_MODE=$mode"
+    echo "EXPERT_STREAMING=$streaming"
     echo "INSTANCES=${instances[*]}"
     exit 0
 fi
@@ -37,7 +39,7 @@ fi
 
 run_instance() {
     local node="$1" port=$(( PORT + $1 ))
-    placement "$mode" "$node"
+    placement "$mode" "$node" "$streaming"
 
     local args=(
         -m "$model" -a "$MODEL_ALIAS"
@@ -49,7 +51,12 @@ run_instance() {
         "${PLACEMENT_ARGS[@]}"
     )
     [[ -n "$API_KEY_FILE" ]] && args+=(--api-key-file "$API_KEY_FILE")
-    if [[ "$MLOCK" == 1 ]]; then
+    if [[ "$streaming" == on ]]; then
+        log "streaming experts from SSD (EXPERT_STREAMING): expect much lower speed than all-in-RAM"
+        # Each prompt batch touches nearly every expert, i.e. one pass over the SSD;
+        # bigger batches spread that pass over more tokens (5x faster prompts at 1024 vs 128).
+        args+=(-b 2048 -ub 2048)
+    elif [[ "$MLOCK" == 1 ]]; then
         if [[ "$(ulimit -l)" == unlimited ]]; then
             args+=(--mlock)
         else
@@ -61,7 +68,7 @@ run_instance() {
     read -r -a extra <<<"$EXTRA_ARGS"
     args+=("${extra[@]}")
 
-    log "instance $node: mode=$mode threads=$RUN_THREADS port=$port model=$(basename "$model")"
+    log "instance $node: mode=$mode streaming=$streaming threads=$RUN_THREADS port=$port model=$(basename "$model")"
     log "exec: ${PLACEMENT_PREFIX[*]} $IK_BIN/llama-server ${args[*]}"
     if [[ -n "$API_KEY" && -z "$API_KEY_FILE" ]]; then
         # Pass the key through a pipe so it never shows up in `ps` or on disk.
