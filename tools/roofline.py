@@ -84,6 +84,7 @@ class Hardware:
 
 HARDWARE = {
     "tr3995wx": Hardware("TR Pro 3995WX, 8ch DDR4-3200 (calibration)", 8, 3200),
+    "genoa": Hardware("EPYC 9004 Genoa, 12ch DDR5-4800", 12, 4800),
     "turin": Hardware("EPYC 9005 Turin, 12ch DDR5-6000", 12, 6000),
     "xeon6": Hardware("Xeon 6 6900P, 12ch DDR5-6400", 12, 6400),
     "xeon6-mr": Hardware("Xeon 6 6900P, 12ch MRDIMM-8800", 12, 8800),
@@ -138,7 +139,13 @@ def main():
                     help="target engine efficiency: share of sustained bandwidth spent streaming weights")
     ap.add_argument("--eff-today", type=float, default=0.45,
                     help="efficiency of today's engines (calibrated on ik_llama.cpp, 3995WX)")
+    ap.add_argument("--target-tps", type=float, default=0,
+                    help="only print the memory bandwidth a single stream needs for this tok/s")
     args = ap.parse_args()
+
+    if args.target_tps:
+        print_target(args)
+        return
 
     print("## Weight footprint and bytes streamed per decoded token\n")
     rows = []
@@ -195,6 +202,27 @@ def main():
     print(md_table(["model", "10 TOPS eff.", "25", "50", "100"], rows))
 
     print_ssd_streaming(args)
+
+
+def print_target(args):
+    """Peak DRAM bandwidth one socket needs for `args.target_tps` single-stream tok/s."""
+    t = args.target_tps
+    print(f"## Memory bandwidth for {t:g} tok/s single-stream decode (DeepSeek-V4-Flash, all weights in RAM)\n")
+    rows = []
+    for label, bits in (("UD-Q8_K_XL (native experts, 8-bit rest)", NATIVE["dsv4-flash"]),
+                        ("UD-Q4_K_XL (4-bit)", PRECISIONS["q4"])):
+        gb = step_gb(MODELS["dsv4-flash"], bits, 1)
+        cells = [label, f"{gb:.1f}"]
+        for eff in (args.eff_today, 0.6, args.eff):
+            cells.append(f"{t * gb / (args.stream_frac * eff):.0f}")
+        rows.append(cells)
+    print(md_table(["quant", "GB per token", f"peak GB/s at eff {args.eff_today}", "at eff 0.6",
+                    f"at eff {args.eff}"], rows))
+    need = t * step_gb(MODELS["dsv4-flash"], PRECISIONS["q4"], 1) / (args.stream_frac * args.eff_today)
+    print(f"\nPlatforms (per socket, all channels populated) vs {need:.0f} GB/s for 4-bit at today's efficiency:\n")
+    rows = [[hw.name, f"{hw.peak_gbs:.0f}", "yes" if hw.peak_gbs >= need else "no"] for hw in HARDWARE.values()]
+    rows.append(["Desktop, 2ch DDR5-5600", f"{2 * 5600 * 8 / 1000:.0f}", "no"])
+    print(md_table(["platform", "peak GB/s", f"reaches {t:g} tok/s"], rows))
 
 
 def ssd_stream_tps(m: Model, bits: tuple, ram_gbs: float, ssd_gbs: float, hit: float) -> float:

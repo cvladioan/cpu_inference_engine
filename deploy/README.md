@@ -14,6 +14,8 @@ OpenAI-compatible API with streaming, tool calling and reasoning output. See
 | `serve.sh` | Starts the API server with the right threads and NUMA placement |
 | `smoke_test.py` | Checks a running server and measures time to first token and tokens/s |
 | `bench.sh` | Measures prompt and generation speed at growing context lengths |
+| `tune.py` | Finds the fastest configuration on this machine and checks it against a target such as 20 tok/s |
+| `quickstart.sh` | Runs everything, from a fresh server to a tuned setup, in one command |
 | `install_service.sh` | Installs the systemd service, which restarts on failure and starts at boot |
 | `nginx.conf.example` | Optional load balancer in front of several instances |
 | `test/run_local_test.sh` | Tests all of the above in about a minute with a tiny fake model |
@@ -63,6 +65,68 @@ python3 deploy/smoke_test.py --fixed-length --concurrency 4   # four users at on
 Add `--api-key <key>` once you have set `API_KEY`.
 
 Loading takes a few minutes: 160 GB is read from disk into RAM.
+
+## Reaching 20 tok/s
+
+Generation speed on a CPU is set by memory bandwidth: every token reads about
+7 GB of weights (4-bit quant). So 20 tok/s for a single user needs about
+400 GB/s of peak memory bandwidth per socket with today's engine efficiency
+(`python3 tools/roofline.py --target-tps 20`).
+
+That means a server CPU with 12 memory channels, all populated:
+
+| Machine | Memory | Expected single-user tok/s (4-bit) |
+|---|---|---|
+| AMD EPYC 9004 Genoa (e.g. Hetzner AX162-R, AWS r7a/m7a) | 12ch DDR5-4800, 460 GB/s | ~23-38 |
+| AMD EPYC 9005 Turin | 12ch DDR5-6000, 576 GB/s | ~29-48 |
+| Intel Xeon 6 6900P | 12ch DDR5-6400 / MRDIMM-8800 | ~31-70 |
+| Desktop PC (for comparison) | 2ch DDR5, ~90 GB/s | ~1-2 when streaming from SSD; ~5 if it all fit in RAM |
+
+The same server roughly doubles its total throughput when several users are
+served at once (`docs/PLAN.md` section 8).
+
+**Renting one:**
+- **Hetzner AX162-R** (EPYC 9454P, about €200-240/month). Order a memory
+  option that populates all 12 channels, for example 12 x 32 GB = 384 GB. An
+  8-DIMM configuration loses a third of the bandwidth.
+- **AWS `r7a.48xlarge` / `m7a.48xlarge`** (2 x Genoa, billed per hour). Run
+  with `NUMA_MODE=per-node`: one instance per socket, each above 20 tok/s.
+
+Either way, confirm the DIMM count with `sudo deploy/check_host.sh`.
+
+**One command** does everything on the server: host check, build, model
+download, tuning against the target, and applying the best settings.
+
+```bash
+cp deploy/config.env.example deploy/config.env
+echo 'QUANT=UD-Q4_K_XL' >> deploy/config.env     # 7.0 GB/token instead of 9.6: ~35% faster
+deploy/quickstart.sh --target 20                  # add --service <user> to install the systemd service
+```
+
+`tune.py` loads the model once per candidate and measures real generation
+speed on code, prose and JSON extraction. It tries:
+- thread counts
+- weight repacking at load (`-rtr`)
+- n-gram self-speculation
+- DSpark speculative decoding, if a draft model is configured
+
+It prints a ranked table, exits with an error if the best result is below
+`--target`, and with `--apply` writes the winner to `deploy/config.env`.
+
+**Two optional speed-ups, both measured before use:**
+- **DSpark drafts.** DeepSeek-V4-Flash-0731 ships a DSpark draft instead of
+  MTP. Reported gains are 1.5-1.9x on GPU, but only +10-15% when the experts
+  run on CPU, and it depends on the text (code benefits most). To let the
+  tuner try it, set these in `deploy/config.env` and run `download_model.sh`
+  again (about 11 GB):
+  ```bash
+  DRAFT_REPO=singulared/DeepSeek-V4-Flash-0731-DSpark-GGUF
+  DRAFT_INCLUDE=*Q8_0*.gguf
+  ```
+- **Fewer experts per token** (`python3 deploy/tune.py --allow-expert-reduction`).
+  `-ser 5,1` or `-ser 4,1` uses 5 or 4 of the 6 routed experts. That reads
+  up to a third fewer expert bytes, but it changes the model's answers, so
+  compare outputs before keeping it.
 
 ## Test on a desktop PC
 
@@ -292,13 +356,16 @@ Results are saved in `$INSTALL_DIR/results/`.
 
 ## What to expect
 
-Rough single-user generation speed per socket, from `docs/PLAN.md`:
+Rough single-user generation speed per socket (`python3 tools/roofline.py`).
+The lower number is today's engine efficiency, the upper one a well-tuned
+setup:
 
-| Server | Tokens/s |
-|---|---|
-| EPYC 9005 Turin, 12ch DDR5-6000 | 21-35 |
-| Xeon 6 6900P, 12ch DDR5-6400 | 22-37 |
-| Xeon 6 6900P, 12ch MRDIMM-8800 | 31-51 |
+| Server | UD-Q8_K_XL | UD-Q4_K_XL |
+|---|---|---|
+| EPYC 9004 Genoa, 12ch DDR5-4800 | 17-28 | 23-38 |
+| EPYC 9005 Turin, 12ch DDR5-6000 | 21-35 | 29-48 |
+| Xeon 6 6900P, 12ch DDR5-6400 | 22-37 | 31-51 |
+| Xeon 6 6900P, 12ch MRDIMM-8800 | 31-51 | 42-70 |
 
 - Prompt processing is much slower than on a GPU: expect a few hundred
   tokens/s. A 20K-token prompt can take a minute to the first token.

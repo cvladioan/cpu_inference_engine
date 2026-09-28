@@ -52,6 +52,11 @@ kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
 server_pid=""
 
+echo "== tune.py"
+python3 "$deploy/tune.py" --quick --threads "$THREADS" --max-tokens 16 --target 1 \
+    --port "$(( PORT + 1 ))" --results-dir "$work/tune"
+ls "$work"/tune/tune-*.json >/dev/null || { echo "FAIL: tune.py wrote no results"; exit 1; }
+
 echo "== bench.sh"
 BENCH_CTX=1024 BENCH_UBATCH=256 RESULTS_DIR="$work/results" "$deploy/bench.sh"
 grep -q '^| *[0-9]' "$work"/results/sweep-*.txt || { echo "FAIL: no benchmark rows"; exit 1; }

@@ -162,6 +162,7 @@ Single-stream decode tok/s **per socket**:
 | Platform | Sustained GB/s | V4-Flash native | Qwen3.5-122B mixed | V3.x/R1 mixed | Dense 123B 4-bit |
 |---|---|---|---|---|---|
 | TR Pro 3995WX, 8ch DDR4-3200 (calibration) | 160 | 7-12 | 9-15 | 3-4 | 1-2 |
+| EPYC 9004 Genoa, 12ch DDR5-4800 | 359 | 17-28 | 20-34 | 6-10 | 2-4 |
 | EPYC 9005 Turin, 12ch DDR5-6000 | 449 | 21-35 | 25-42 | 7-12 | 3-5 |
 | Xeon 6 6900P, 12ch DDR5-6400 | 479 | 22-37 | 27-45 | 8-13 | 3-5 |
 | Xeon 6 6900P, 12ch MRDIMM-8800 | 659 | 31-51 | 37-62 | 11-18 | 4-7 |

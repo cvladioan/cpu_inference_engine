@@ -63,7 +63,19 @@ run_instance() {
             log "memlock limit is $(ulimit -l) KB: skipping --mlock (the systemd unit sets LimitMEMLOCK=infinity)"
         fi
     fi
-    [[ -n "$SPEC_TYPE" ]] && args+=(--spec-type "$SPEC_TYPE")
+    if [[ -n "$SPEC_TYPE" ]]; then
+        args+=(--spec-type "$SPEC_TYPE")
+        # Stages that run a separate draft model need -md.
+        if [[ "$SPEC_TYPE" =~ ^(dspark|dflash|draft|mtp) ]]; then
+            local draft
+            draft=$(resolve_draft)
+            if [[ -n "$draft" ]]; then
+                args+=(-md "$draft")
+            elif [[ ! "$SPEC_TYPE" =~ ^mtp ]]; then
+                die "SPEC_TYPE=$SPEC_TYPE needs a draft model: set DRAFT_REPO (and run download_model.sh) or DRAFT_FILE"
+            fi
+        fi
+    fi
     local extra=()
     read -r -a extra <<<"$EXTRA_ARGS"
     args+=("${extra[@]}")

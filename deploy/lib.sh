@@ -30,7 +30,7 @@ load_config() {
 declare -A __ENV_OVERRIDES=()
 for __var in INSTALL_DIR IK_LLAMA_REPO IK_LLAMA_COMMIT HF_REPO QUANT MODEL_DIR MODEL_FILE \
     MODEL_ALIAS HOST PORT API_KEY API_KEY_FILE NUMA_MODE THREADS PARALLEL CTX_PER_SLOT CACHE_RAM_MIB \
-    MLOCK EXPERT_STREAMING SPEC_TYPE EXTRA_ARGS; do
+    MLOCK EXPERT_STREAMING SPEC_TYPE DRAFT_REPO DRAFT_INCLUDE DRAFT_FILE EXTRA_ARGS; do
     if [[ -n "${!__var+x}" ]]; then
         __ENV_OVERRIDES[$__var]="${!__var}"
     fi
@@ -53,6 +53,17 @@ resolve_model() {
         -path "*${QUANT}*" 2>/dev/null | sort | head -n1)
     [[ -n "$found" ]] || die "no ${QUANT} .gguf found under $MODEL_DIR (run deploy/download_model.sh or set MODEL_FILE)"
     echo "$found"
+}
+
+# Path of the speculative-decoding draft model, or empty when none is configured.
+resolve_draft() {
+    if [[ -n "$DRAFT_FILE" ]]; then
+        [[ -f "$DRAFT_FILE" ]] || die "DRAFT_FILE=$DRAFT_FILE does not exist"
+        echo "$DRAFT_FILE"
+    elif [[ -n "$DRAFT_REPO" ]]; then
+        find "$MODEL_DIR/draft" -name '*.gguf' \( -name '*-00001-of-*' -o ! -name '*-of-*' \) \
+            2>/dev/null | sort | head -n1
+    fi
 }
 
 numa_nodes() {

@@ -20,3 +20,15 @@ log "downloading ${HF_REPO} (${QUANT}) into ${MODEL_DIR}; resumes if interrupted
 model=$(resolve_model)
 touch "$MODEL_DIR/.download-complete-$QUANT"
 log "done: $model ($(( $(model_size_mib "$model") / 1024 )) GB)"
+
+if [[ -n "$DRAFT_REPO" ]]; then
+    log "downloading draft model ${DRAFT_REPO} (${DRAFT_INCLUDE}) into ${MODEL_DIR}/draft"
+    if [[ "${dl[0]}" == hf ]]; then
+        hf download "$DRAFT_REPO" --include "$DRAFT_INCLUDE" --local-dir "$MODEL_DIR/draft"
+    else
+        huggingface-cli download "$DRAFT_REPO" --include "$DRAFT_INCLUDE" --local-dir "$MODEL_DIR/draft"
+    fi
+    draft=$(resolve_draft)
+    [[ -n "$draft" ]] || die "no .gguf matched DRAFT_INCLUDE=$DRAFT_INCLUDE in $DRAFT_REPO"
+    log "draft: $draft"
+fi
