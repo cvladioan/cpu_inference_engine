@@ -27,15 +27,15 @@ cmake --build "$src/build" --config Release -j"$(nproc)" \
     --target llama-server llama-sweep-bench llama-bench llama-cli
 
 # Confirm the fast quantized kernels were compiled in (see ik_llama.cpp docs/build.md).
-if grep -qw avx512_vnni /proc/cpuinfo; then
+if grep -qw -E 'avx512_vnni|avx_vnni' /proc/cpuinfo; then
     # The kernels live in the ggml shared library (or in the binary for static builds).
     lib=$(find "$src/build" -name 'libggml.so' -print -quit)
     n=$(objdump -d "${lib:-$src/build/bin/llama-server}" 2>/dev/null | grep -c vpdpbusd || true)
-    if [[ "${n:-0}" -lt 100 ]]; then
-        log "WARNING: CPU has AVX512-VNNI but only ${n:-0} vpdpbusd instructions in ggml;"
-        log "         the IQK AVX-512 kernels may have fallen back to AVX2 (check compiler version)."
+    if [[ "${n:-0}" -lt 20 ]]; then
+        log "WARNING: CPU has VNNI but only ${n:-0} vpdpbusd instructions in ggml;"
+        log "         the quantized kernels may have fallen back to plain AVX2 (check compiler version)."
     else
-        log "AVX512-VNNI kernels present ($n vpdpbusd instructions)"
+        log "VNNI kernels present ($n vpdpbusd instructions)"
     fi
 fi
 

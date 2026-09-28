@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Report whether this server can run DeepSeek-V4-Flash CPU-only, and roughly how fast.
+# Report whether this machine can run the configured model CPU-only, and roughly how fast.
 # Run as root to also see the DIMM population (dmidecode). Exit code 1 = blocking problem.
 set -uo pipefail
 source "$(dirname "$0")/lib.sh"
@@ -10,39 +10,87 @@ ok()   { printf '  [ok]   %s\n' "$*"; }
 warn() { printf '  [warn] %s\n' "$*"; }
 bad()  { printf '  [FAIL] %s\n' "$*"; fail=1; }
 
-# Approximate file sizes (GB) of the Unsloth quants of DeepSeek-V4-Flash-0731.
-case "$QUANT" in
-    UD-Q8_K_XL) model_gb=162 ;;
-    UD-Q4_K_XL) model_gb=155 ;;
-    *)          model_gb=170 ;;
-esac
+# Value of `key` in a Windows .wslconfig (INI), lower-cased, or empty.
+wslconfig_get() {
+    awk -F= -v k="$2" '{ gsub(/[ \t\r]/, "") } tolower($1) == tolower(k) { print tolower($2); exit }' "$1"
+}
+
+# WSL2 hides half of Windows RAM by default and drops the page cache (the
+# expert cache when streaming) after a few idle minutes; check .wslconfig.
+wsl_config_check() {
+    local profile cfg mem reclaim
+    profile=$(cd /mnt/c 2>/dev/null && timeout 5 cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')
+    cfg=""
+    [[ -n "$profile" ]] && command -v wslpath >/dev/null && cfg="$(wslpath -u "$profile")/.wslconfig"
+    if [[ -n "$cfg" && -f "$cfg" ]]; then
+        mem=$(wslconfig_get "$cfg" memory)
+        reclaim=$(wslconfig_get "$cfg" autoMemoryReclaim)
+        echo "  .wslconfig: memory=${mem:-default (half of Windows RAM)}, autoMemoryReclaim=${reclaim:-default (dropcache)}"
+        [[ -z "$mem" ]] && warn "set memory= in .wslconfig (e.g. 26GB on a 32 GB PC); WSL2 gets half of RAM by default"
+        if [[ "$reclaim" != disabled ]]; then
+            warn "set autoMemoryReclaim=disabled under [experimental] in .wslconfig: otherwise WSL2 drops cached experts when idle"
+        fi
+    else
+        warn "no .wslconfig found: WSL2 gets half of Windows RAM and drops its page cache when idle (see deploy/README.md)"
+    fi
+    if [[ "$(realpath -m "$INSTALL_DIR")" == /mnt/* ]]; then
+        bad "INSTALL_DIR is on a Windows drive ($INSTALL_DIR): use a Linux path such as ~/deepseek-cpu (much faster reads)"
+    fi
+}
+
+# Model size: the real file if it is already downloaded, else the approximate
+# size of the Unsloth DeepSeek-V4-Flash-0731 quants (MODEL_GB overrides).
+if model_path=$(resolve_model 2>/dev/null); then
+    model_gb=$(( ($(model_size_mib "$model_path") + 1023) / 1024 ))
+else
+    model_path=""
+    case "$QUANT" in
+        UD-Q8_K_XL) model_gb=162 ;;
+        UD-Q4_K_XL) model_gb=155 ;;
+        *)          model_gb=170 ;;
+    esac
+    model_gb=${MODEL_GB:-$model_gb}
+fi
+is_wsl=0
+grep -qi microsoft /proc/version 2>/dev/null && is_wsl=1
 
 echo "== CPU"
 lscpu | grep -E '^(Model name|Socket\(s\)|Core\(s\) per socket|NUMA node\(s\))' | sed 's/^/  /'
 flags=$(grep -m1 '^flags' /proc/cpuinfo)
 has() { [[ " $flags " == *" $1 "* ]]; }
 has avx2 && ok "AVX2" || bad "no AVX2: ik_llama.cpp needs at least AVX2"
-if has avx512f && has avx512_vnni; then ok "AVX-512 + VNNI (fast quantized kernels)"
-else warn "no AVX-512 VNNI: expect noticeably slower prompt processing"; fi
-has avx512_bf16 && ok "AVX512-BF16" || warn "no AVX512-BF16"
-has amx_int8 && ok "AMX (Intel Sapphire Rapids or newer)" || echo "  [info] no AMX (AMD, or Intel before Sapphire Rapids)"
+if has avx512f && has avx512_vnni; then
+    ok "AVX-512 + VNNI (fast quantized kernels)"
+    has avx512_bf16 && ok "AVX512-BF16" || warn "no AVX512-BF16"
+elif has avx_vnni; then
+    ok "AVX-VNNI (256-bit VNNI kernels; no AVX-512, so prompts are slower than on server CPUs)"
+else
+    warn "no VNNI: expect noticeably slower prompt processing"
+fi
+has amx_int8 && ok "AMX (Intel Sapphire Rapids or newer)" || echo "  [info] no AMX (AMD, desktop, or Intel before Sapphire Rapids)"
+if [[ -d /sys/devices/cpu_core && -d /sys/devices/cpu_atom ]] \
+    || lscpu | grep -qE 'Model name:.*(1[234]th Gen Intel|Core\(TM\) Ultra)'; then
+    warn "hybrid P/E-core CPU: set THREADS to the number of P-cores (6 on a Core i5-13xxx) and try more with bench.sh"
+fi
 
 echo "== Memory"
 total_gb=$(awk '/MemTotal/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
 avail_gb=$(( $(mem_available_mib) / 1024 ))
-echo "  total ${total_gb} GB, available ${avail_gb} GB; ${QUANT} needs ~${model_gb} GB + KV cache + prompt cache"
+echo "  total ${total_gb} GB, available ${avail_gb} GB; ${QUANT} is ~${model_gb} GB${model_path:+ (downloaded)}, plus KV cache and prompt cache"
 need_gb=$(( model_gb + 16 + CACHE_RAM_MIB / 1024 ))
 streaming_needed=0
 if (( avail_gb >= need_gb )); then ok "enough RAM for one copy (~${need_gb} GB)"
 elif (( avail_gb >= model_gb + 8 )); then warn "tight: lower CACHE_RAM_MIB / PARALLEL * CTX_PER_SLOT"
 elif [[ "$EXPERT_STREAMING" == off ]]; then
     bad "not enough RAM for ${QUANT} (~${model_gb} GB) and EXPERT_STREAMING=off"
-elif (( avail_gb < 24 )); then
-    bad "only ${avail_gb} GB available: too little even for streaming experts from SSD (need 24+ GB)"
+elif (( avail_gb < 16 )); then
+    bad "only ${avail_gb} GB available: too little even for streaming experts from SSD (need 16+ GB)"
 else
     streaming_needed=1
     warn "model is larger than RAM: experts will stream from SSD (EXPERT_STREAMING), expect a few tok/s"
-    echo "         (~$(( (avail_gb - 12) * 100 / model_gb ))% of the model fits in the page cache; see docs/PLAN.md section 12)"
+    cached=$(( (avail_gb - 8) * 100 / model_gb ))
+    echo "         (~$(( cached > 0 ? cached : 0 ))% of the model fits in the page cache; see docs/PLAN.md section 12)"
+    (( avail_gb < 32 )) && warn "little RAM left for the expert cache: expect about 1-2 tok/s"
 fi
 
 nodes=$(numa_nodes | wc -l)
@@ -79,6 +127,10 @@ swap_kb=$(awk '/SwapTotal/ { print $2 }' /proc/meminfo)
 if (( nodes > 1 )); then
     command -v numactl >/dev/null && ok "numactl installed" || bad "numactl missing (apt install numactl / dnf install numactl)"
 fi
+if (( is_wsl )); then
+    echo "  [info] running under WSL2"
+    wsl_config_check
+fi
 memlock=$(ulimit -l)
 [[ "$memlock" == unlimited ]] && ok "memlock unlimited" \
     || echo "  [info] memlock limit ${memlock} KB in this shell; the systemd unit sets LimitMEMLOCK=infinity"
@@ -103,12 +155,14 @@ if command -v lsblk >/dev/null && [[ "$dev" == /dev/* ]]; then
     fi
 fi
 disk_gb=$(df -BG --output=avail "$INSTALL_DIR" 2>/dev/null | tail -n1 | tr -dc 0-9)
-if [[ -f "$MODEL_DIR/.download-complete-$QUANT" ]]; then ok "model ${QUANT} already downloaded"
+if [[ -n "$model_path" ]]; then ok "model ${QUANT} already downloaded"
 elif (( ${disk_gb:-0} >= model_gb + 10 )); then ok "${disk_gb} GB free in $INSTALL_DIR"
 else bad "${disk_gb:-?} GB free in $INSTALL_DIR, need ~$(( model_gb + 10 )) GB for ${QUANT}"; fi
 
 echo "== Rough decode estimate (single user, one socket)"
-if [[ -n "$peak_gbs" ]]; then
+if (( streaming_needed )); then
+    echo "  expert streaming: ~1-2 tok/s with 32 GB RAM, ~2-4 tok/s with 64-128 GB (docs/PLAN.md section 12)"
+elif [[ -n "$peak_gbs" ]]; then
     per_socket=$(( peak_gbs / $(lscpu | awk -F: '/^Socket\(s\)/ { print $2 + 0 }') ))
     # ~9.6 GB read per token for native-precision V4-Flash; 45-75% of 78% of peak bandwidth.
     awk -v bw="$per_socket" 'BEGIN { printf "  ~%d-%d tok/s (see docs/PLAN.md section 5)\n", bw * 0.78 * 0.45 / 9.6, bw * 0.78 * 0.75 / 9.6 }'

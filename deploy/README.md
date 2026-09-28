@@ -70,56 +70,145 @@ A desktop can run the full model by streaming experts from the SSD. It is
 good for trying things out, not for serving users.
 
 **What you need:**
-- Linux, or Windows with WSL2.
+- Linux, or Windows 10/11 with WSL2.
 - 32 GB of RAM or more; 64 GB or more is much better.
-- An NVMe SSD with about 170 GB free.
+- An NVMe SSD with about 170 GB free, plus about 15 GB for a small test
+  model.
 
-**What to expect:** roughly 2-4 tok/s once warm; the first request is slow
-while the cache fills. Even with everything in RAM, a 2-channel desktop tops
-out around 5 tok/s on this model (details in `docs/PLAN.md` section 12).
-Long prompts are slow because every prompt batch reads most experts from the
-SSD.
+**What to expect on a 32 GB desktop:**
+- A small model that fits in RAM (step 1 below) runs at 10-20 tok/s.
+- DeepSeek-V4-Flash streams from the SSD at about 1-2 tok/s once warm. The
+  first request after a start is slower, and long prompts take minutes.
+- Even with everything in RAM, a 2-channel desktop would top out around
+  5 tok/s on this model (`docs/PLAN.md` section 12).
 
-**Settings.** Put these in `deploy/config.env`:
+### Windows: set up WSL2
+
+1. **Install Ubuntu.** In PowerShell (as administrator), run the command
+   below. Restart if asked, then open "Ubuntu" from the Start menu and create
+   a user.
+   ```powershell
+   wsl --install -d Ubuntu-24.04
+   ```
+2. **Give WSL2 more RAM and keep its cache.** Create
+   `C:\Users\<you>\.wslconfig` with:
+   ```ini
+   [wsl2]
+   memory=26GB
+
+   [experimental]
+   autoMemoryReclaim=disabled
+   ```
+   Why these settings:
+   - By default WSL2 gets only half of your RAM.
+   - By default it also empties its file cache after a few idle minutes,
+     which throws away the cached experts.
+
+   Run `wsl --shutdown` in PowerShell, then reopen Ubuntu. `free -g` should
+   show about 25 GB. 26GB leaves about 6 GB for Windows on a 32 GB PC, so
+   close large apps while testing.
+3. **Install the tools** in Ubuntu:
+   ```bash
+   sudo apt update && sudo apt install -y build-essential cmake git python3-venv
+   python3 -m venv ~/hf && ~/hf/bin/pip install -U "huggingface_hub[cli,hf_xet]"
+   echo 'export PATH="$HOME/hf/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+   ```
+4. **Clone this repository** in your Linux home directory (for example
+   `~/cpu_inference_engine`), not under `/mnt/c`. Windows drives are mounted
+   through a slow file-sharing layer. Keep `INSTALL_DIR` on the Linux side
+   too.
+
+Notes:
+- The Linux disk is a file on your C: drive that grows as models are
+  downloaded and does not shrink by itself. After deleting models, reclaim the
+  space with `wsl --manage Ubuntu-24.04 --set-sparse true`, or by compacting
+  the disk.
+- `check_host.sh` reads your `.wslconfig` and warns about missing settings.
+
+### Step 1: a small model that fits in RAM
+
+Start with gpt-oss-20b (12 GB). It checks the build, server and API at a
+usable speed. Put this in `deploy/config.env`:
 
 ```bash
-INSTALL_DIR=$HOME/deepseek-cpu   # on the NVMe drive
-QUANT=UD-Q4_K_XL                 # fewer bytes per token than UD-Q8_K_XL
+INSTALL_DIR=$HOME/deepseek-cpu
+HF_REPO=ggml-org/gpt-oss-20b-GGUF
+QUANT=mxfp4
+MODEL_DIR=$HOME/deepseek-cpu/models/gpt-oss-20b
+MODEL_ALIAS=gpt-oss-20b
+THREADS=6            # P-cores only on Intel 12th-14th gen (6 on a Core i5-13xxx)
 PARALLEL=1
 CTX_PER_SLOT=16384
 CACHE_RAM_MIB=2048
-EXPERT_STREAMING=auto            # turns on by itself when the model is larger than RAM
 ```
 
-Then follow the Quick start. `check_host.sh` warns instead of failing when
-the model is larger than RAM, and checks that the model directory is on
-NVMe. `serve.sh --plan` shows `EXPERT_STREAMING=on`.
-
-**Check streaming before the 160 GB download.** Generate a fake MoE model
-somewhat larger than your RAM and serve it:
+Then:
 
 ```bash
-python3 deploy/test/make_tiny_gguf.py --size-gb 80 ~/moe-test.gguf   # e.g. 80 GB for a 64 GB PC
-MODEL_FILE=~/moe-test.gguf deploy/serve.sh
+deploy/check_host.sh
+deploy/build.sh
+deploy/download_model.sh
+deploy/serve.sh
 ```
 
 In a second terminal:
 
 ```bash
-python3 deploy/smoke_test.py --fixed-length   # run twice: cold, then warm
+python3 deploy/smoke_test.py --fixed-length
 ```
 
-Delete `~/moe-test.gguf` afterwards.
+On hybrid Intel CPUs, the efficiency cores slow everyone down when the
+threads have to wait for each other. So compare `THREADS=6` against 8 and 10
+with `deploy/bench.sh` (stop the server first) and keep the fastest.
 
-**WSL2 notes:**
-- Keep `INSTALL_DIR` on the Linux filesystem (for example `~/deepseek-cpu`),
-  not under `/mnt/c`: Windows drives are mounted through a slow file-sharing
-  layer.
-- WSL2 gets only half of your RAM by default. Raise the limit with
-  `memory=` in `%UserProfile%\.wslconfig`, then run `wsl --shutdown`.
+### Step 2: DeepSeek-V4-Flash with SSD streaming
 
-**macOS:** these scripts are Linux-only. On a Mac, use mainline llama.cpp,
-which has a Metal GPU backend.
+**Optional: check streaming first, without the big download.**
+1. Generate a fake MoE model larger than WSL's RAM (the file is about 40 GB):
+   ```bash
+   python3 deploy/test/make_tiny_gguf.py --size-gb 40 ~/moe-test.gguf
+   ```
+2. Serve it:
+   ```bash
+   MODEL_FILE=~/moe-test.gguf deploy/serve.sh
+   ```
+   `serve.sh` should log `streaming=on`.
+3. In a second terminal, run the smoke test twice (cold, then warm):
+   ```bash
+   python3 deploy/smoke_test.py --fixed-length
+   ```
+4. Delete `~/moe-test.gguf` afterwards.
+
+**Measure your SSD's read speed from inside WSL.** It bounds the streaming
+speed:
+
+```bash
+dd if=/dev/zero of=~/ddtest bs=4M count=1024 oflag=direct status=progress   # writes 4 GB
+dd if=~/ddtest of=/dev/null bs=4M iflag=direct status=progress              # read speed
+rm ~/ddtest
+```
+
+**Switch the model lines in `deploy/config.env`**, then run
+`download_model.sh` (about 155 GB) and `serve.sh`:
+
+```bash
+HF_REPO=unsloth/DeepSeek-V4-Flash-0731-GGUF
+QUANT=UD-Q4_K_XL     # ~155 GB. A 2-bit quant (~91-97 GB) reads fewer bytes per token:
+                     # faster, but lower quality. Check the repo's file list for names.
+MODEL_DIR=$HOME/deepseek-cpu/models/DeepSeek-V4-Flash-0731-GGUF
+MODEL_ALIAS=deepseek-v4-flash
+EXTRA_ARGS="--reasoning-budget 0"   # skip the thinking phase; at 1-2 tok/s it takes minutes
+```
+
+`EXPERT_STREAMING=auto` turns streaming on by itself because the model is
+larger than RAM. `serve.sh --plan` shows it, and `check_host.sh` warns instead
+of failing.
+
+### Linux desktops and macOS
+
+- **Linux desktop:** the same steps without the WSL2 setup.
+- **macOS:** these scripts are Linux-only. On a Mac, use mainline llama.cpp,
+  which has a Metal GPU backend.
 
 ## Run it as a service
 
