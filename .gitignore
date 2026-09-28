@@ -1,0 +1,5 @@
+# Local settings; may contain the API key.
+deploy/config.env
+# Written by llama.cpp tools in the working directory.
+llama.log
+__pycache__/

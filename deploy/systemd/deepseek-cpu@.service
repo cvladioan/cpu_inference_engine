@@ -1,0 +1,24 @@
+# Rendered and installed by deploy/install_service.sh; @REPO_DIR@ and @USER@ are
+# filled in there. One instance per NUMA node in per-node mode (%i = node),
+# otherwise only instance 0.
+[Unit]
+Description=DeepSeek-V4-Flash CPU inference server (ik_llama.cpp), instance %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@REPO_DIR@
+ExecStart=@REPO_DIR@/deploy/serve.sh --node %i
+Restart=on-failure
+RestartSec=15
+# Loading ~160 GB takes minutes; do not treat a slow start as a failure.
+TimeoutStartSec=0
+TimeoutStopSec=60
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

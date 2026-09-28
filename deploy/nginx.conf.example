@@ -1,0 +1,33 @@
+# Optional: one endpoint in front of several llama-server instances
+# (NUMA_MODE=per-node gives one per NUMA node on PORT, PORT+1, ...; you can also
+# list instances on other servers here). Put this in /etc/nginx/conf.d/.
+
+upstream deepseek_cpu {
+    # Send each request to the instance with the fewest open requests.
+    least_conn;
+    # For agents that resend a growing conversation, routing the same session to
+    # the same instance lets it reuse its prompt cache. If clients send a stable
+    # session header, replace least_conn with:
+    #   hash $http_x_session_id consistent;
+    server 127.0.0.1:8080 max_fails=0;
+    server 127.0.0.1:8081 max_fails=0;
+    keepalive 32;
+}
+
+server {
+    listen 8000;
+
+    # Responses are streamed token by token (server-sent events).
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    # Long generations on CPU can take minutes.
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    client_max_body_size 32m;
+
+    location / {
+        proxy_pass http://deepseek_cpu;
+    }
+}
