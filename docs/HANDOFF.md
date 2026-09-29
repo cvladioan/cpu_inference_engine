@@ -58,7 +58,9 @@ The work in progress (section 7) targets (b), then (a).
 | `tools/membw.c` | DRAM read-bandwidth benchmark per thread count |
 | `tools/ram_limit.py` | Holds RAM to emulate a smaller-RAM PC (forces SSD streaming) |
 | `docs/EXPERT_CACHE.md` | **Explicit expert cache**: design, correctness, results (4.4-6x over the page cache) |
-| `engine/patches/` | Patches to ik_llama.cpp, applied by `deploy/build.sh` (currently: the explicit expert cache) |
+| `engine/patches/` | Patches to ik_llama.cpp, applied in order by `deploy/build.sh`: `0001` the explicit expert cache, `0002` fits its budget to available memory (KV cache, compute buffers, cgroup limits) so it cannot cause an out-of-memory kill |
+| `tools/cache_ab.py` | A/B benchmark on any model: page cache vs expert cache (and budgets), decode tok/s, disk MiB/token, hit rate, identical-output check |
+| `docs/HOME_TESTS.md` | Runbook for the real-model tests on the 32 GB Windows PC (WSL2) |
 | `deploy/test/greedy_outputs.py` | Greedy completions plus top-5 probabilities as JSON, and `--compare` to prove an engine change does not alter results |
 | `tools/expert_pin.py` | Prototype: pins non-expert weights plus a budget of experts in the page cache with `mlock`; no engine changes |
 | `deploy/` | Working deployment of DeepSeek-V4-Flash on ik_llama.cpp. Runbook: `deploy/README.md` |

@@ -13,6 +13,8 @@ The first target is DeepSeek-V4-Flash (284B total, 13B active).
 - [`docs/EXPERT_CACHE.md`](docs/EXPERT_CACHE.md): the explicit expert cache, an
   engine change (`engine/patches/`) that runs MoE models larger than RAM 4-6x
   faster than the OS page cache.
+- [`docs/HOME_TESTS.md`](docs/HOME_TESTS.md): step-by-step tests of the expert
+  cache with DeepSeek-V4-Flash on a 32 GB Windows PC (WSL2).
 - [`docs/PLAN.md`](docs/PLAN.md): research, hardware sizing, performance
   estimates, and the longer-term plan for a custom engine.
 - [`tools/roofline.py`](tools/roofline.py): bandwidth roofline calculator

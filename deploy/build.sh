@@ -19,16 +19,30 @@ fi
 git -C "$src" -c advice.detachedHead=false checkout --quiet "$IK_LLAMA_COMMIT"
 log "ik_llama.cpp at $(git -C "$src" log -1 --format='%h %cs %s')"
 
-# Apply this repository's engine patches (engine/patches/*.patch), idempotently.
+# Apply this repository's engine patches (engine/patches/*.patch) in order. Later patches
+# change files earlier ones add, so patches cannot be checked one by one: a stamp records
+# the applied set, and when the set changes the tree is reset to the pinned commit and
+# every patch is applied again. Local edits under $src are discarded then.
+patches=()
 for patch in "$DEPLOY_DIR"/../engine/patches/*.patch; do
-    [[ -e "$patch" ]] || continue
-    if git -C "$src" apply --reverse --check "$patch" 2>/dev/null; then
-        log "patch already applied: $(basename "$patch")"
-    else
+    [[ -e "$patch" ]] && patches+=("$patch")
+done
+stamp="$src/.engine-patches"
+want="$IK_LLAMA_COMMIT"
+for patch in "${patches[@]}"; do
+    want+=$'\n'"$(basename "$patch") $(sha256sum <"$patch" | cut -d' ' -f1)"
+done
+if [[ "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
+    log "engine patches already applied: ${#patches[@]}"
+else
+    git -C "$src" reset --quiet --hard "$IK_LLAMA_COMMIT"
+    git -C "$src" clean -fdq   # files added by earlier patches; ignored files (build/) stay
+    for patch in "${patches[@]}"; do
         git -C "$src" apply "$patch" || die "patch $(basename "$patch") does not apply to $IK_LLAMA_COMMIT"
         log "applied patch: $(basename "$patch")"
-    fi
-done
+    done
+    printf '%s\n' "$want" >"$stamp"
+fi
 
 # GGML_NATIVE=ON compiles for this CPU (-march=native): AVX-512/VNNI/BF16 and AMX
 # are enabled when present. Do not copy the binaries to a different CPU model.

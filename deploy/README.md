@@ -159,12 +159,15 @@ good for trying things out, not for serving users.
    ```ini
    [wsl2]
    memory=26GB
+   swap=0
 
    [experimental]
    autoMemoryReclaim=disabled
    ```
    Why these settings:
    - By default WSL2 gets only half of your RAM.
+   - By default it also has a swap file, and it could move the expert cache
+     there, which is slower than reading the experts again.
    - By default it also empties its file cache after a few idle minutes,
      which throws away the cached experts.
 

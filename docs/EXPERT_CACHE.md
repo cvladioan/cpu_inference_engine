@@ -83,6 +83,8 @@ wiring.
 
 - The regression test runs this comparison automatically whenever the build
   has the patch (`deploy/test/greedy_outputs.py --compare`).
+- `tools/cache_ab.py` runs the same check on any model, together with the speed
+  comparison. It is the tool for real-model validation (`docs/HOME_TESTS.md`).
 
 ## 4. Results
 
@@ -147,9 +149,18 @@ llama-server -m model.gguf --defer-experts --expert-cache 18000 ...
 LLAMA_EXPERT_CACHE_LOG=2000 llama-server ...   # log hit rate every 2000 layer calls; always logged at exit
 ```
 
-**Sizing:** the OS cannot drop the cache's memory the way it drops page cache.
-A budget that leaves too little free RAM gets the process (or another one)
-killed by the out-of-memory killer, so size conservatively. Auto sizing does.
+**Sizing:** the OS cannot drop the cache's memory the way it drops page cache,
+so the budget must leave room for everything else.
+- Auto sizing leaves headroom.
+- As a safety net, the engine checks free memory on first use
+  (`engine/patches/0002-fit-cache-budget-to-memory.patch`). By then the weights
+  are resident and the KV cache and compute buffers are allocated. It lowers
+  any budget that would not fit, and logs `budget lowered from X to Y GiB`.
+- The check counts buffers that are allocated but not yet used, and memory
+  cgroup limits (containers, systemd `MemoryMax`), which `MemAvailable` does
+  not show.
+- Tested with a 5.9 GiB budget where only 1.5 GiB was really free: the budget
+  was lowered to 0.24 GiB, with no out-of-memory kill and identical outputs.
 
 **Swap:** the cache memory is not locked. With swap enabled the kernel may
 swap cached experts out, which is slower than re-reading them from the model

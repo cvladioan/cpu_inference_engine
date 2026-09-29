@@ -18,17 +18,21 @@ wslconfig_get() {
 # WSL2 hides half of Windows RAM by default and drops the page cache (the
 # expert cache when streaming) after a few idle minutes; check .wslconfig.
 wsl_config_check() {
-    local profile cfg mem reclaim
+    local profile cfg mem reclaim swap
     profile=$(cd /mnt/c 2>/dev/null && timeout 5 cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')
     cfg=""
     [[ -n "$profile" ]] && command -v wslpath >/dev/null && cfg="$(wslpath -u "$profile")/.wslconfig"
     if [[ -n "$cfg" && -f "$cfg" ]]; then
         mem=$(wslconfig_get "$cfg" memory)
         reclaim=$(wslconfig_get "$cfg" autoMemoryReclaim)
-        echo "  .wslconfig: memory=${mem:-default (half of Windows RAM)}, autoMemoryReclaim=${reclaim:-default (dropcache)}"
+        swap=$(wslconfig_get "$cfg" swap)
+        echo "  .wslconfig: memory=${mem:-default (half of Windows RAM)}, autoMemoryReclaim=${reclaim:-default (dropcache)}, swap=${swap:-default (a quarter of memory)}"
         [[ -z "$mem" ]] && warn "set memory= in .wslconfig (e.g. 26GB on a 32 GB PC); WSL2 gets half of RAM by default"
         if [[ "$reclaim" != disabled ]]; then
             warn "set autoMemoryReclaim=disabled under [experimental] in .wslconfig: otherwise WSL2 drops cached experts when idle"
+        fi
+        if [[ ! "$swap" =~ ^0([kmgt]?b)?$ ]]; then
+            warn "set swap=0 under [wsl2] in .wslconfig: WSL2 could swap the expert cache out to its swap file"
         fi
     else
         warn "no .wslconfig found: WSL2 gets half of Windows RAM and drops its page cache when idle (see deploy/README.md)"
@@ -123,7 +127,7 @@ thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo unknow
 [[ "$thp" == *"[always]"* || "$thp" == *"[madvise]"* ]] && ok "transparent hugepages: $thp" \
     || warn "transparent hugepages disabled ($thp)"
 swap_kb=$(awk '/SwapTotal/ { print $2 }' /proc/meminfo)
-(( swap_kb > 0 )) && warn "swap enabled: keep MLOCK=1 so the model is never paged out" || ok "no swap"
+(( swap_kb > 0 )) && warn "swap enabled: sudo swapoff -a (the expert cache is not locked and could be swapped out; with the model in RAM, MLOCK=1 also works)" || ok "no swap"
 if (( nodes > 1 )); then
     command -v numactl >/dev/null && ok "numactl installed" || bad "numactl missing (apt install numactl / dnf install numactl)"
 fi
