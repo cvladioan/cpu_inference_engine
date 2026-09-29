@@ -19,6 +19,17 @@ fi
 git -C "$src" -c advice.detachedHead=false checkout --quiet "$IK_LLAMA_COMMIT"
 log "ik_llama.cpp at $(git -C "$src" log -1 --format='%h %cs %s')"
 
+# Apply this repository's engine patches (engine/patches/*.patch), idempotently.
+for patch in "$DEPLOY_DIR"/../engine/patches/*.patch; do
+    [[ -e "$patch" ]] || continue
+    if git -C "$src" apply --reverse --check "$patch" 2>/dev/null; then
+        log "patch already applied: $(basename "$patch")"
+    else
+        git -C "$src" apply "$patch" || die "patch $(basename "$patch") does not apply to $IK_LLAMA_COMMIT"
+        log "applied patch: $(basename "$patch")"
+    fi
+done
+
 # GGML_NATIVE=ON compiles for this CPU (-march=native): AVX-512/VNNI/BF16 and AMX
 # are enabled when present. Do not copy the binaries to a different CPU model.
 cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_CUDA=OFF \

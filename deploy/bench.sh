@@ -19,8 +19,9 @@ BENCH_CTX=${BENCH_CTX:-16384}
 # Match serve.sh: streaming uses 2048-token prompt batches.
 BENCH_UBATCH=${BENCH_UBATCH:-$([[ "$streaming" == on ]] && echo 2048 || echo 1024)}
 mode=$(resolve_numa_mode "$streaming")
+cache_mib=$(resolve_expert_cache "$streaming")
 # One instance is what a single server process gets: node 0 in per-node mode.
-placement "$mode" 0 "$streaming"
+placement "$mode" 0 "$streaming" "$cache_mib"
 
 extra=()
 read -r -a extra <<<"$EXTRA_ARGS"
@@ -36,7 +37,7 @@ out="$RESULTS_DIR/sweep-$(hostname -s)-$(basename "$model" .gguf)-$(date +%Y%m%d
 {
     echo "# host: $(hostname) | cpu: $(lscpu | awk -F: '/Model name/ { gsub(/^ +/, "", $2); print $2; exit }')"
     echo "# ik_llama.cpp: $(git -C "$INSTALL_DIR/ik_llama.cpp" log -1 --format='%h %cs' 2>/dev/null || echo unknown)"
-    echo "# numa mode: $mode | expert streaming: $streaming | threads: $RUN_THREADS | extra: ${EXTRA_ARGS:-none}"
+    echo "# numa mode: $mode | expert streaming: $streaming (cache ${cache_mib} MiB) | threads: $RUN_THREADS | extra: ${EXTRA_ARGS:-none}"
     echo "# cmd: ${PLACEMENT_PREFIX[*]} llama-sweep-bench ${args[*]}"
 } | tee "$out"
 

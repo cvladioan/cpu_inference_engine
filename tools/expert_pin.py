@@ -143,12 +143,27 @@ def plan(tensors, budget, hot=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model", help="GGUF file (first shard only is supported)")
-    ap.add_argument("--budget-gib", type=float, required=True, help="RAM to pin")
+    ap.add_argument("--budget-gib", type=float, help="RAM to pin")
+    ap.add_argument("--summary", action="store_true",
+                    help="print total, expert and non-expert MiB of the file (used by deploy/lib.sh) and exit")
     ap.add_argument("--hot", help="JSON file with expert ids per layer, most used first")
     ap.add_argument("--dry-run", action="store_true", help="print the plan without pinning")
     args = ap.parse_args()
 
+    if args.summary:
+        # Split models (name-00001-of-0000N.gguf): every shard has its own tensor table.
+        m = re.match(r"(.*)-00001-of-(\d+)\.gguf$", args.model)
+        paths = [f"{m.group(1)}-{i:05d}-of-{m.group(2)}.gguf" for i in range(1, int(m.group(2)) + 1)] if m else [args.model]
+        experts = total = 0
+        for path in paths:
+            for n, (d, o, size) in read_gguf(path).items():
+                total += size
+                experts += size if "_exps" in n and len(d) == 3 else 0
+        print(f"total_mib={total >> 20} expert_mib={experts >> 20} dense_mib={(total - experts) >> 20}")
+        return
     tensors = read_gguf(args.model)
+    if args.budget_gib is None:
+        ap.error("--budget-gib is required unless --summary is given")
     hot = json.load(open(args.hot)) if args.hot else None
     ranges, dense, used = plan(tensors, int(args.budget_gib * (1 << 30)), hot)
     n_exp_total = sum(size for n, (d, o, size) in tensors.items() if "_exps" in n)

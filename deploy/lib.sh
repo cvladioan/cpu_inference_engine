@@ -30,7 +30,7 @@ load_config() {
 declare -A __ENV_OVERRIDES=()
 for __var in INSTALL_DIR IK_LLAMA_REPO IK_LLAMA_COMMIT HF_REPO QUANT MODEL_DIR MODEL_FILE \
     MODEL_ALIAS HOST PORT API_KEY API_KEY_FILE NUMA_MODE THREADS PARALLEL CTX_PER_SLOT CACHE_RAM_MIB \
-    MLOCK EXPERT_STREAMING SPEC_TYPE DRAFT_REPO DRAFT_INCLUDE DRAFT_FILE EXTRA_ARGS; do
+    MLOCK EXPERT_STREAMING EXPERT_CACHE_MIB EXPERT_CACHE_HEADROOM_MIB SPEC_TYPE DRAFT_REPO DRAFT_INCLUDE DRAFT_FILE EXTRA_ARGS; do
     if [[ -n "${!__var+x}" ]]; then
         __ENV_OVERRIDES[$__var]="${!__var}"
     fi
@@ -121,6 +121,38 @@ resolve_streaming() {
     fi
 }
 
+# Expert cache budget in MiB when streaming (0 = use the OS page cache instead).
+# Pass the resolved streaming mode (on/off) as $1.
+resolve_expert_cache() {
+    local streaming="$1" summary dense budget
+    if [[ "$streaming" != on || "$EXPERT_CACHE_MIB" == 0 ]]; then
+        echo 0
+        return
+    fi
+    # Capture first: with pipefail, `--help | grep -q` fails when grep exits early.
+    local help
+    help=$("$IK_BIN/llama-server" --help 2>&1 || true)
+    if [[ "$help" != *--expert-cache* ]]; then
+        log "llama-server was built without the expert cache patch (rerun deploy/build.sh); using the page cache"
+        echo 0
+        return
+    fi
+    if [[ "$EXPERT_CACHE_MIB" != auto ]]; then
+        echo "$EXPERT_CACHE_MIB"
+        return
+    fi
+    summary=$(python3 "$DEPLOY_DIR/../tools/expert_pin.py" "$(resolve_model)" --summary) || { echo 0; return; }
+    dense=$(sed -n 's/.*dense_mib=\([0-9]*\).*/\1/p' <<<"$summary")
+    # Cache memory cannot be reclaimed by the OS, so stay well clear of an out-of-memory kill.
+    budget=$(( ($(mem_available_mib) - dense - EXPERT_CACHE_HEADROOM_MIB - CACHE_RAM_MIB) * 9 / 10 ))
+    if (( budget < 512 )); then
+        log "only ${budget} MiB of RAM left for the expert cache; using the page cache"
+        echo 0
+        return
+    fi
+    echo "$budget"
+}
+
 # Resolve NUMA_MODE=auto into none, interleave or per-node for this machine.
 # Pass the resolved streaming mode (on/off) as $1.
 resolve_numa_mode() {
@@ -157,10 +189,10 @@ resolve_numa_mode() {
 }
 
 # Fill PLACEMENT_PREFIX (command prefix) and PLACEMENT_ARGS (llama.cpp args) for
-# running on NUMA node $2 under mode $1 with expert streaming $3 (on/off),
-# plus RUN_THREADS.
+# running on NUMA node $2 under mode $1 with expert streaming $3 (on/off) and an
+# expert cache of $4 MiB (0 = page cache), plus RUN_THREADS.
 placement() {
-    local mode="$1" node="${2:-0}" streaming="${3:-off}"
+    local mode="$1" node="${2:-0}" streaming="${3:-off}" cache_mib="${4:-0}"
     PLACEMENT_PREFIX=()
     PLACEMENT_ARGS=()
     case "$mode" in
@@ -188,6 +220,10 @@ placement() {
         for a in "${PLACEMENT_ARGS[@]}"; do
             [[ "$a" == --no-mmap ]] || keep+=("$a")
         done
-        PLACEMENT_ARGS=("${keep[@]}" --defer-experts --prefetch-experts)
+        if (( cache_mib > 0 )); then
+            PLACEMENT_ARGS=("${keep[@]}" --defer-experts --expert-cache "$cache_mib")
+        else
+            PLACEMENT_ARGS=("${keep[@]}" --defer-experts --prefetch-experts)
+        fi
     fi
 }

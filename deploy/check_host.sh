@@ -69,7 +69,7 @@ else
 fi
 has amx_int8 && ok "AMX (Intel Sapphire Rapids or newer)" || echo "  [info] no AMX (AMD, desktop, or Intel before Sapphire Rapids)"
 if [[ -d /sys/devices/cpu_core && -d /sys/devices/cpu_atom ]] \
-    || lscpu | grep -qE 'Model name:.*(1[234]th Gen Intel|Core\(TM\) Ultra)'; then
+    || grep -qE 'Model name:.*(1[234]th Gen Intel|Core\(TM\) Ultra)' <<<"$(lscpu)"; then
     warn "hybrid P/E-core CPU: set THREADS to the number of P-cores (6 on a Core i5-13xxx) and try more with bench.sh"
 fi
 

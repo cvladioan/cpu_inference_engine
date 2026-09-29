@@ -10,6 +10,9 @@ The first target is DeepSeek-V4-Flash (284B total, 13B active).
   build, model download, NUMA-aware launch, benchmarks and a systemd service.
 - [`docs/BOTTLENECKS.md`](docs/BOTTLENECKS.md): measured analysis of what blocks big
   models on common CPUs, and the research agenda that follows.
+- [`docs/EXPERT_CACHE.md`](docs/EXPERT_CACHE.md): the explicit expert cache, an
+  engine change (`engine/patches/`) that runs MoE models larger than RAM 4-6x
+  faster than the OS page cache.
 - [`docs/PLAN.md`](docs/PLAN.md): research, hardware sizing, performance
   estimates, and the longer-term plan for a custom engine.
 - [`tools/roofline.py`](tools/roofline.py): bandwidth roofline calculator

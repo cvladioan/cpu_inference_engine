@@ -229,7 +229,7 @@ most experts: about 156 GB per full pass.
 
 | # | Blocker | Cost on a common PC | Kind | What fixes it | Status |
 |---|---|---|---|---|---|
-| 1 | Model ≫ RAM, streamed through the OS page cache | 5-10x (0.3-0.5 tok/s instead of ~2-3) | Software | Explicit expert cache (non-expert pinned, frequency-aware, scan-resistant, exact reads), predictive prefetch | **Open.** Pinning prototype gave 2x |
+| 1 | Model ≫ RAM, streamed through the OS page cache | 5-10x (0.3-0.5 tok/s instead of ~2-3) | Software | Explicit expert cache (non-expert pinned, frequency-aware, scan-resistant, exact reads), predictive prefetch | **Done: explicit expert cache, 4.4-6x (docs/EXPERT_CACHE.md).** Predictive prefetch open |
 | 2 | Low expert-cache hit rate (routing spread over 256 experts) | ~2x at 32 GB | Software (routing) | Cache-aware routing (training-free); ReMoE-style router tuning | Open (docs/HANDOFF.md section 7) |
 | 3 | Bytes per token (~7 GB even at 4-bit) | Sets the ~5 tok/s ceiling on 2-channel RAM | Model + format | 2-bit and tiered-precision experts; lower-bit non-expert weights; fewer experts per token (`-ser`) | Partly available; needs quality gates |
 | 4 | Engine uses ~50-60% of bandwidth | ~1.7x | Software | Kernels, repacking (+11% measured), fusion, fewer barriers | Partly available |
@@ -243,8 +243,9 @@ most experts: about 156 GB per full pass.
 
 In order of expected gain per effort on common PCs:
 
-1. **Explicit expert cache (R1).** Replace the page cache for expert
-   weights:
+1. **Explicit expert cache (R1). Done:** see `docs/EXPERT_CACHE.md`.
+   Measured 4.4-6x faster decoding and 5-8x less disk traffic than the page
+   cache, with bit-identical outputs. Original design goals:
    - non-expert weights always resident
    - a scan-resistant, frequency-aware pool of whole experts, with a budget
      set from available RAM

@@ -22,6 +22,7 @@ done
 model=$(resolve_model)
 streaming=$(resolve_streaming)
 mode=$(resolve_numa_mode "$streaming")
+cache_mib=$(resolve_expert_cache "$streaming")
 if [[ "$mode" == per-node ]]; then
     mapfile -t instances < <(numa_nodes)
 else
@@ -31,6 +32,7 @@ fi
 if (( plan )); then
     echo "NUMA_MODE=$mode"
     echo "EXPERT_STREAMING=$streaming"
+    echo "EXPERT_CACHE_MIB=$cache_mib"
     echo "INSTANCES=${instances[*]}"
     exit 0
 fi
@@ -39,7 +41,7 @@ fi
 
 run_instance() {
     local node="$1" port=$(( PORT + $1 ))
-    placement "$mode" "$node" "$streaming"
+    placement "$mode" "$node" "$streaming" "$cache_mib"
 
     local args=(
         -m "$model" -a "$MODEL_ALIAS"
@@ -52,7 +54,7 @@ run_instance() {
     )
     [[ -n "$API_KEY_FILE" ]] && args+=(--api-key-file "$API_KEY_FILE")
     if [[ "$streaming" == on ]]; then
-        log "streaming experts from SSD (EXPERT_STREAMING): expect much lower speed than all-in-RAM"
+        log "streaming experts from SSD (EXPERT_STREAMING), expert cache ${cache_mib} MiB: expect much lower speed than all-in-RAM"
         # Each prompt batch touches nearly every expert, i.e. one pass over the SSD;
         # bigger batches spread that pass over more tokens (5x faster prompts at 1024 vs 128).
         args+=(-b 2048 -ub 2048)

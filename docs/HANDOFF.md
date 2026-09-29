@@ -57,6 +57,9 @@ The work in progress (section 7) targets (b), then (a).
 | `tools/engine_profile.py` | Runs the measurements on any machine: DRAM bandwidth, decode efficiency, prefill GFLOP/s, per-layer overhead |
 | `tools/membw.c` | DRAM read-bandwidth benchmark per thread count |
 | `tools/ram_limit.py` | Holds RAM to emulate a smaller-RAM PC (forces SSD streaming) |
+| `docs/EXPERT_CACHE.md` | **Explicit expert cache**: design, correctness, results (4.4-6x over the page cache) |
+| `engine/patches/` | Patches to ik_llama.cpp, applied by `deploy/build.sh` (currently: the explicit expert cache) |
+| `deploy/test/greedy_outputs.py` | Greedy completions plus top-5 probabilities as JSON, and `--compare` to prove an engine change does not alter results |
 | `tools/expert_pin.py` | Prototype: pins non-expert weights plus a budget of experts in the page cache with `mlock`; no engine changes |
 | `deploy/` | Working deployment of DeepSeek-V4-Flash on ik_llama.cpp. Runbook: `deploy/README.md` |
 | `deploy/check_host.sh` | Host readiness check: CPU ISA, RAM, DIMMs, NUMA, disk/NVMe, WSL `.wslconfig` |
@@ -184,8 +187,19 @@ measured in this session. Key findings:
   cores.
 
 **Revised order of work:**
-1. **R1: explicit expert cache.** It replaces the page cache for expert
-   weights:
+1. **R1: explicit expert cache. DONE (2026-09-29).** Full write-up in
+   `docs/EXPERT_CACHE.md`; the patch is in
+   `engine/patches/0001-explicit-expert-cache.patch` and `deploy/build.sh`
+   applies it.
+   - Results against the page cache, same VM and model: 3.6 GB free
+     0.5 → 2.2 tok/s; 4.0 GB free 0.6 → 3.9 tok/s; 4.6 GB free 1.9 →
+     8.3 tok/s. Disk reads fell 5-8x.
+   - Outputs are bit-identical; the regression test checks this.
+   - Engine code lives in `src/llama-expert-cache.{h,cpp}` of ik_llama.cpp,
+     hooked in `llm_build_moe_ffn`.
+   - Deploy: `EXPERT_CACHE_MIB=auto` (default), `EXPERT_CACHE_HEADROOM_MIB`.
+
+   The original design goals were:
    - non-expert weights always resident
    - a frequency-aware, scan-resistant pool of whole experts
    - exact-slice reads, no read-ahead
@@ -337,4 +351,4 @@ git checkout d741de5074cd424dd3ba7cfc4d9b7649f1eb0463
 
 If you continue with Claude Code, point it at this file:
 
-> Read docs/HANDOFF.md and docs/BOTTLENECKS.md, then continue with R1 (explicit expert cache) from section 7.
+> Read docs/HANDOFF.md, docs/BOTTLENECKS.md and docs/EXPERT_CACHE.md, then continue with R2 (cache-aware routing) from section 7b, built on the expert cache.

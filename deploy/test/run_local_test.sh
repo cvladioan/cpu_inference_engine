@@ -61,4 +61,32 @@ echo "== bench.sh"
 BENCH_CTX=1024 BENCH_UBATCH=256 RESULTS_DIR="$work/results" "$deploy/bench.sh"
 grep -q '^| *[0-9]' "$work"/results/sweep-*.txt || { echo "FAIL: no benchmark rows"; exit 1; }
 
+ik_bin=$(bash -c 'source "$1/lib.sh"; load_config; echo "$IK_BIN"' _ "$deploy")
+ik_help=$("$ik_bin/llama-server" --help 2>&1 || true)
+if [[ "$ik_help" == *--expert-cache* ]]; then
+    echo "== expert cache: outputs must match exactly, even with a budget far below one token's experts"
+    python3 "$here/make_tiny_gguf.py" --embd 256 --ff 256 --experts 16 --used 4 --layers 4 --heads 4 "$work/moe.gguf"
+    for variant in baseline cache; do
+        extra=""
+        [[ "$variant" == cache ]] && extra="--defer-experts --expert-cache 4"
+        MODEL_FILE="$work/moe.gguf" API_KEY='' PORT=$(( PORT + 2 )) EXPERT_STREAMING=off EXPERT_CACHE_MIB=0 \
+            EXTRA_ARGS="$extra" "$deploy/serve.sh" >"$work/$variant.log" 2>&1 &
+        server_pid=$!
+        for _ in $(seq 60); do
+            curl -sf "http://$HOST:$(( PORT + 2 ))/health" >/dev/null && break
+            kill -0 "$server_pid" 2>/dev/null || { cat "$work/$variant.log"; echo "FAIL: server exited"; exit 1; }
+            sleep 1
+        done
+        python3 "$here/greedy_outputs.py" "http://$HOST:$(( PORT + 2 ))" >"$work/$variant.json"
+        kill "$server_pid"
+        wait "$server_pid" 2>/dev/null || true
+        server_pid=""
+    done
+    grep -h "expert cache (final)" "$work/cache.log" || true
+    python3 "$here/greedy_outputs.py" --compare "$work/baseline.json" "$work/cache.json" \
+        || { echo "FAIL: expert cache changed the outputs"; exit 1; }
+else
+    echo "== expert cache: skipped (llama-server built without engine/patches)"
+fi
+
 echo "PASS"
