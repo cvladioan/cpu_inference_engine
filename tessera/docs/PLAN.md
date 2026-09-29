@@ -112,7 +112,8 @@ option drops experts, on the CPU and on CUDA.
 **Not verified yet:**
 - **Speed, and the concurrency of the GPU and CPU halves.** This needs a GPU; the first run on the target PC will
   show it.
-- **The CUDA build.** It compiles here against CUDA 12.0 for sm_89; setup-wsl.sh installs 12.8.
+- **The CUDA build on your PC.** The full engine builds without errors here against CUDA 12.0 for sm_89 (RTX 40),
+  and its `llama-server` has `--hot-experts`. setup-wsl.sh installs 12.8, which is not tested here.
 - **Architectures other than llama-style MoE.** Qwen3-Next and Qwen3.5/3.6 use the same MoE builder in the engine,
   so they should work, but they are untested.
 

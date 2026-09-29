@@ -33,8 +33,8 @@ engine built the way Strata is, for any MoE model.
   calibration, serving and benchmark scripts, and WSL2 setup (CUDA from NVIDIA's WSL
   repository, since Ubuntu's package pulls a Linux driver library).
 - **Verified:** outputs match the plain engine in every configuration (CPU-only test,
-  `tessera/tests/run_tests.sh`). A deliberately wrong mapping is caught. The changed
-  files compile with CUDA 12.0 for sm_89.
+  `tessera/tests/run_tests.sh`). A deliberately wrong mapping is caught. The full
+  engine builds with CUDA 12.0 for sm_89 (RTX 40).
 - **Not verified yet:** the first GPU run on the PC (speed, GPU/CPU overlap).
 - **Estimates** (`tessera/docs/PLAN.md`):
   - Qwen3.6-35B-A3B Q6_K ~50 tok/s;
