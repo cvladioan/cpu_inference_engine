@@ -1,0 +1,178 @@
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index e612bb0f..048d79c5 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -10,6 +10,8 @@
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <cstdio>
++#include <fstream>
+ #include <iterator>
+ #include <list>
+ #include <string>
+@@ -34,6 +36,64 @@ constexpr int64_t SCAN_TOKENS = 16;
+ constexpr double PROTECTED_SHARE = 0.8;
+ // Read granularity: large enough for NVMe efficiency, small enough to spread over threads.
+ constexpr size_t CHUNK = 1 << 20;
++// Memory left free when the budget is fitted to available memory (OS, allocations we cannot see).
++constexpr int64_t SLACK = 512ll << 20;
++
++int64_t read_int(const std::string & path) {
++    std::ifstream in(path);
++    long long v;
++    return in >> v ? (int64_t) v : -1;  // -1 also for "max"
++}
++
++int64_t stat_value(const std::string & path, const std::string & key) {
++    std::ifstream in(path);
++    std::string k;
++    long long v;
++    while (in >> k >> v) {
++        if (k == key) {
++            return v;
++        }
++    }
++    return 0;
++}
++
++// Memory this process can still use: MemAvailable, bounded by its memory cgroup's limit
++// (containers, systemd MemoryMax) less the cgroup's non-file usage. -1 if unknown.
++int64_t available_memory() {
++    int64_t avail = -1;
++    std::ifstream meminfo("/proc/meminfo");
++    std::string line;
++    while (std::getline(meminfo, line)) {
++        long long kb;
++        if (sscanf(line.c_str(), "MemAvailable: %lld kB", &kb) == 1) {
++            avail = (int64_t) kb * 1024;
++            break;
++        }
++    }
++    std::ifstream cgroups("/proc/self/cgroup");
++    while (std::getline(cgroups, line)) {
++        std::string dir, limit, usage, file_key;
++        size_t p;
++        if (line.rfind("0::", 0) == 0) {
++            dir = "/sys/fs/cgroup" + line.substr(3);
++            limit = "/memory.max", usage = "/memory.current", file_key = "file";
++        } else if ((p = line.find(":memory:")) != std::string::npos) {
++            dir = "/sys/fs/cgroup/memory" + line.substr(p + 8);
++            limit = "/memory.limit_in_bytes", usage = "/memory.usage_in_bytes", file_key = "total_cache";
++        } else {
++            continue;
++        }
++        const int64_t lim = read_int(dir + limit), use = read_int(dir + usage);
++        if (lim <= 0 || use < 0 || lim >= (int64_t) 1 << 60) {
++            continue;  // no limit
++        }
++        const int64_t cg_avail = lim - (use - stat_value(dir + "/memory.stat", file_key));
++        if (avail < 0 || cg_avail < avail) {
++            avail = cg_avail;
++        }
++    }
++    return avail;
++}
+ 
+ size_t page_size() {
+ #if EXPERT_CACHE_SUPPORTED
+@@ -118,6 +178,8 @@ struct llama_expert_cache {
+     // When the budget is smaller, recency-based eviction cycles through everything and keeps
+     // nothing, so misses are then admitted "cold" to keep a stable resident set instead.
+     size_t working_set = 0;
++    // Allocated but untouched context memory (llama_expert_cache_reserve).
++    size_t reserve = 0;
+ 
+     // Statistics.
+     uint64_t hits = 0, misses = 0, evictions = 0, calls = 0;
+@@ -151,6 +213,7 @@ struct llama_expert_cache {
+     layer_state * layer(int il, std::initializer_list<ggml_tensor *> weights);
+ 
+     void make_dense_resident();
++    void fit_budget(int64_t n_used);
+     void touch(uint64_t k, entry & en);
+     void evict(uint64_t k);
+     void make_room(size_t need);
+@@ -323,6 +386,29 @@ void llama_expert_cache::make_dense_resident() {
+ }
+ 
+ // A hit: decode hits promote probation -> protected; protected hits refresh recency.
++// On first use (weights resident, context buffers allocated, no experts loaded yet): cap the
++// budget to what memory allows, so a budget sized too optimistically slows decoding down
++// instead of getting this or another process killed for lack of memory.
++void llama_expert_cache::fit_budget(int64_t n_used) {
++    const int64_t avail = available_memory();
++    if (avail < 0) {
++        return;
++    }
++    const int64_t limit = avail - (int64_t) reserve - SLACK;
++    if (limit >= (int64_t) budget) {
++        return;
++    }
++    size_t floor = 0;  // one layer's experts for one token
++    for (const auto & [il, l] : layers) {
++        floor = std::max(floor, l->expert_bytes * (size_t) n_used);
++    }
++    const size_t fitted = std::max(floor, (size_t) std::max<int64_t>(limit, 0));
++    LLAMA_LOG_WARN("expert cache: %.2f GiB available, %.2f GiB of it still needed by the KV cache and compute "
++                   "buffers: budget lowered from %.2f to %.2f GiB\n", avail / 1073741824.0,
++                   reserve / 1073741824.0, budget / 1073741824.0, fitted / 1073741824.0);
++    budget = fitted;
++}
++
+ void llama_expert_cache::touch(uint64_t k, entry & en) {
+     const size_t bytes = layers.at((int) (k >> 32))->expert_bytes;
+     if (en.prot) {
+@@ -439,6 +525,7 @@ void plan_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void *
+         for (const auto & [il, l] : c.layers) {
+             c.working_set += l->expert_bytes * (size_t) a->ne[0];
+         }
++        c.fit_budget(a->ne[0]);
+         LLAMA_LOG_INFO("expert cache: %.2f GiB of experts per token; %s\n", c.working_set / 1073741824.0,
+                        c.budget < c.working_set ? "budget is smaller, keeping a stable resident set"
+                                                 : "budget holds at least one token's experts");
+@@ -580,6 +667,10 @@ std::shared_ptr<llama_expert_cache> llama_expert_cache_create(const llama_model
+ #endif
+ }
+ 
++void llama_expert_cache_reserve(llama_expert_cache * cache, size_t bytes) {
++    cache->reserve += bytes;
++}
++
+ ggml_tensor * llama_expert_cache_wrap(ggml_context * ctx, llama_expert_cache * cache, int il, ggml_tensor * ids,
+                                       std::initializer_list<ggml_tensor *> weights) {
+     if (cache == nullptr) {
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+index e3b4f2b3..cb29c863 100644
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -28,6 +28,10 @@ struct llama_expert_cache;
+ // Returns nullptr (and logs why) when the model is not memory-mapped from files.
+ std::shared_ptr<llama_expert_cache> llama_expert_cache_create(const llama_model & model, size_t budget_bytes);
+ 
++// Bytes a context has allocated but not yet touched (KV cache, compute buffers). Free memory
++// does not show them yet, so on first use the budget is capped to leave room for them.
++void llama_expert_cache_reserve(llama_expert_cache * cache, size_t bytes);
++
+ // Graph hook for one MoE layer: returns the tensor to use as expert ids for the
+ // expert matmuls. The returned tensor carries the same ids; computing it first
+ // makes the selected experts of `weights` resident.
+diff --git a/src/llama.cpp b/src/llama.cpp
+index b761530f..def4724e 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -9736,6 +9736,14 @@ struct llama_context * llama_init_from_model(
+         LLAMA_LOG_INFO("%s: enabling only_active_experts scheduling\n", __func__);
+         ggml_backend_sched_set_only_active_experts(ctx->sched, true);
+     }
++    if (ctx->expert_cache && ctx->sched) {
++        // Allocated but not yet touched, so free memory does not show them yet.
++        size_t reserve = ctx->kv_self.total_size();
++        for (auto * backend : ctx->backends) {
++            reserve += ggml_backend_sched_get_buffer_size(ctx->sched, backend);
++        }
++        llama_expert_cache_reserve(ctx->expert_cache.get(), reserve);
++    }
+     if (params.prefetch_experts && !ctx->expert_cache) {
+         LLAMA_LOG_INFO("%s: enabling MoE expert read-ahead (prefetch_experts), %s\n", __func__,
+                 ggml_backend_prefetch_init(params.prefetch_experts_threads) ? "threaded populate engine" : "madvise fallback");

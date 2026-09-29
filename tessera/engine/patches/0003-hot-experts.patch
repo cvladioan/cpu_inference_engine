@@ -1,0 +1,756 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index 64b96f0e..25f27307 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2206,6 +2206,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
+         params.expert_cache_mib = std::stoi(argv[i]);
+         return true;
+     }
++    if (arg == "--hot-experts") {
++        CHECK_ARG;
++        params.hot_experts = argv[i];
++        return true;
++    }
++    if (arg == "--hot-experts-mib") {
++        CHECK_ARG;
++        params.hot_experts_mib = std::stoi(argv[i]);
++        return true;
++    }
+     if (arg == "--fit-margin") {
+         CHECK_ARG;
+         int32_t margin = std::stoi(argv[i]);
+@@ -3343,6 +3353,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
+                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
+     options.push_back({ "*",           "       --expert-cache N",       "keep mmap'd MoE experts in an explicit N MiB cache: exact direct-I/O reads,\n"
+                                                                         "scan-resistant eviction; for models larger than RAM (Linux, default: 0 = off)"});
++    options.push_back({ "*",           "       --hot-experts FILE",     "copy the experts FILE names (\"layer expert\" per line, most used first) to VRAM;\n"
++                                                                        "MoE layers compute them on the GPU and the rest on the CPU (needs -ot exps=CPU)"});
++    options.push_back({ "*",           "       --hot-experts-mib N",    "VRAM for --hot-experts, in MiB (default: 0 = off)"});
+     options.push_back({ "*",           "       --fit-margin N",         "safety margin in MiB when auto-fitting model offloading"});
+     options.push_back({ "*",           "-gfm,  --gpu-fit-margin N",     "per-layer GPU fit margin as layer_id,margin pairs, comma-separated" });
+     options.push_back({ "*",           "-wgt, --worst-graph-tokens N",  "number of tokens to use for worst-case graph"});
+@@ -4325,6 +4338,8 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
+     mparams.mtp             = params.has_mtp || params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+     mparams.flash_attn      = params.flash_attn;
+     mparams.defer_experts   = params.defer_experts;
++    mparams.hot_experts     = params.hot_experts.empty() ? nullptr : params.hot_experts.c_str();
++    mparams.hot_experts_mib = params.hot_experts_mib;
+     mparams.defer_ple       = params.defer_ple;
+     mparams.swa_compress    = params.swa_compress;
+     if (params.kv_overrides.empty()) {
+diff --git a/common/common.h b/common/common.h
+index 68860cee..fb2df8cd 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -461,6 +461,8 @@ struct gpt_params {
+     bool prefetch_experts  = false; // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
+     int  prefetch_experts_threads = 0; // number of expert prefetch workers (<=0 = auto)
+     int  expert_cache_mib = 0; // >0: explicit cache for mmap'd MoE experts, in MiB (Linux only)
++    std::string hot_experts;   // Tessera: profile of the experts to copy to VRAM (most used first)
++    int  hot_experts_mib  = 0; // Tessera: VRAM for the hot experts, in MiB
+     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
+     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)
+     bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling
+diff --git a/include/llama.h b/include/llama.h
+index f81790dc..23b58855 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -422,6 +422,11 @@ extern "C" {
+ 
+         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
+ 
++        // Tessera: copy the experts a profile names (most used first) to VRAM, up to hot_experts_mib; the MoE layers
++        // then compute those on the GPU and the others on the CPU (needs the experts in host memory, -ot exps=CPU)
++        const char * hot_experts;
++        int32_t      hot_experts_mib;
++
+         // Keep the booleans together to avoid misalignment during copy-by-value.
+         bool vocab_only;    // only load the vocabulary, no weights
+         bool use_mmap;      // use mmap if possible
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index ecdd847a..aa2b9498 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -49,6 +49,7 @@ add_library(llama
+             llama-sampling.cpp
+             llama-mmap.cpp
+             llama-expert-cache.cpp
++            llama-hot-experts.cpp
+             llama-model-loader.cpp
+             llama-load-tensors.cpp
+             llama-build-context.h
+diff --git a/src/llama-build-context.cpp b/src/llama-build-context.cpp
+index 1a993734..3a61ea48 100644
+--- a/src/llama-build-context.cpp
++++ b/src/llama-build-context.cpp
+@@ -4,6 +4,7 @@
+ #include "llama-model.h"
+ #include "llama-context.h"
+ #include "llama-delta-net.h"
++#include "llama-hot-experts.h"
+ 
+ #include "ggml.h"
+ 
+@@ -1589,11 +1590,7 @@ llm_expert_gating_func_type   gating_op,
+         ggml_build_forward_expand(graph, weights);
+     }
+ 
+-    if (lctx.expert_cache) {
+-        // Make the selected experts resident before any expert matmul reads them.
+-        selected_experts = llama_expert_cache_wrap(ctx, lctx.expert_cache.get(), il, selected_experts,
+-                {up_exps, gate_exps, down_exps, up_gate_exps});
+-    }
++    selected_experts = llama_routing_trace_wrap(ctx, il, selected_experts);
+ 
+     cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+ 
+@@ -1605,123 +1602,165 @@ llm_expert_gating_func_type   gating_op,
+         cb(cur, "ffn_moe_weighted", il);
+     }
+ 
+-    // For now we don't modify the fused up/gate op to include biases.
+-    // Hence, if we have biases, we cannot use fmoe.
+-    //
+-    //bool can_use_fmoe = !up_exps_b && !gate_exps_b && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
+-    bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI);
+-
+-    ggml_tensor * par;
+-    if (can_use_fmoe && up_gate_exps) {
+-        if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
+-            par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur, selected_experts, up_gate_exps_b, nullptr,
+-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+-                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
++    // The routed experts' weighted sum, [n_embd, n_tokens], for one set of expert tensors and ids.
++    auto moe_part = [&](ggml_tensor * up_e, ggml_tensor * gate_e, ggml_tensor * down_e, ggml_tensor * up_gate_e,
++                        ggml_tensor * ids, ggml_tensor * w) -> ggml_tensor * {
++        // For now we don't modify the fused up/gate op to include biases.
++        // Hence, if we have biases, we cannot use fmoe.
++        //
++        //bool can_use_fmoe = !up_exps_b && !gate_exps_b && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
++        bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI);
++
++        ggml_tensor * par;
++        if (can_use_fmoe && up_gate_e) {
++            if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
++                par = ggml_moe_up_gate_ext(ctx, up_gate_e, nullptr, cur, ids, up_gate_exps_b, nullptr,
++                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
++                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
++            } else {
++                GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
++                par = ggml_moe_up_gate(ctx, up_gate_e, nullptr, cur, ids,
++                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
++            }
++            *((float *)(par->op_params + 1)) = lctx.model.swiglu_limit(il, false);
+         } else {
+-            GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
+-            par = ggml_moe_up_gate(ctx, up_gate_exps, nullptr, cur, selected_experts,
+-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+-        }
+-        *((float *)(par->op_params + 1)) = lctx.model.swiglu_limit(il, false);
+-    } else {
+-    GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
++        GGML_ASSERT(!up_gate_e && !up_gate_exps_b);
+ 
+-    if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
+-        if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
+-            par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
+-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+-                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
++        if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_e->type == gate_e->type) {
++            if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
++                par = ggml_moe_up_gate_ext(ctx, up_e, gate_e, cur, ids, up_exps_b, gate_exps_b,
++                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
++                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
++            } else {
++                GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
++                par = ggml_moe_up_gate(ctx, up_e, gate_e, cur, ids,
++                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
++            }
++            *(float *)(par->op_params + 1) = lctx.model.swiglu_limit(il, false);
+         } else {
+-            GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
+-            par = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur, selected_experts,
+-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+-        }
+-        *(float *)(par->op_params + 1) = lctx.model.swiglu_limit(il, false);
+-    } else {
+-        ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+-        cb(up, "ffn_moe_up", il);
++            ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_e, cur, ids); // [n_ff, n_expert_used, n_tokens]
++            cb(up, "ffn_moe_up", il);
+ 
+-        ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+-        cb(gate, "ffn_moe_gate", il);
++            ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_e, cur, ids); // [n_ff, n_expert_used, n_tokens]
++            cb(gate, "ffn_moe_gate", il);
+ 
+-        if (graph) {
+-            // So we can potentially fuse the up and gate mul_mat_id
+-            ggml_build_forward_expand(graph, up);
+-            ggml_build_forward_expand(graph, gate);
+-        }
++            if (graph) {
++                // So we can potentially fuse the up and gate mul_mat_id
++                ggml_build_forward_expand(graph, up);
++                ggml_build_forward_expand(graph, gate);
++            }
+ 
+-        if (up_exps_b) {
+-            up = ggml_add_id(ctx, up, up_exps_b, selected_experts);
+-            cb(up, "ffn_moe_up_biased", il);
+-        }
++            if (up_exps_b) {
++                up = ggml_add_id(ctx, up, up_exps_b, ids);
++                cb(up, "ffn_moe_up_biased", il);
++            }
+ 
+-        if (gate_exps_b) {
+-            gate = ggml_add_id(ctx, gate, gate_exps_b, selected_experts);
+-            cb(gate, "ffn_moe_gate_biased", il);
+-        }
++            if (gate_exps_b) {
++                gate = ggml_add_id(ctx, gate, gate_exps_b, ids);
++                cb(gate, "ffn_moe_gate_biased", il);
++            }
++
++            if (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) {
++                par = ggml_fused_mul_unary(ctx, gate, up, type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
++                *((float *)(par->op_params + 1)) = lctx.model.swiglu_limit(il, false);
++            } else if (type_op == LLM_FFN_SWIGLU_OAI) {
++                constexpr float alpha = 1.702f;
++                constexpr float limit = 7.0f;
++                par = ggml_swiglu_oai(ctx, gate, up, alpha, limit);
++            }
++            else {
++                GGML_ABORT("fatal error");
++            }
+ 
+-        if (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) {
+-            par = ggml_fused_mul_unary(ctx, gate, up, type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+-            *((float *)(par->op_params + 1)) = lctx.model.swiglu_limit(il, false);
+-        } else if (type_op == LLM_FFN_SWIGLU_OAI) {
+-            constexpr float alpha = 1.702f;
+-            constexpr float limit = 7.0f;
+-            par = ggml_swiglu_oai(ctx, gate, up, alpha, limit);
+         }
+-        else {
+-            GGML_ABORT("fatal error");
+         }
++        cb(par, "ffn_moe_gate_par", il);
+ 
+-    }
+-    }
+-    cb(par, "ffn_moe_gate_par", il);
++        ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_e, par, ids); // [n_embd, n_expert_used, n_tokens]
++        cb(experts, "ffn_moe_down", il);
+ 
+-    ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
+-    cb(experts, "ffn_moe_down", il);
+-
+-    if (down_exps_b) {
+-        experts = ggml_add_id(ctx, experts, down_exps_b, selected_experts);
+-        cb(experts, "ffn_moe_down_biased", il);
+-    }
++        if (down_exps_b) {
++            experts = ggml_add_id(ctx, experts, down_exps_b, ids);
++            cb(experts, "ffn_moe_down_biased", il);
++        }
+ 
+-    if (down_exps_s && !lctx.cparams.fused_mmad) {
+-        GGML_ASSERT(!weight_before_ffn);
+-        auto s = ggml_reshape_3d(ctx, down_exps_s, 1, n_expert, 1);
+-        s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tokens, 1);
+-        s = ggml_get_rows(ctx, s, selected_experts);
+-        auto w_reshaped = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+-        auto s_reshaped = ggml_reshape_2d(ctx, s, n_expert_used, n_tokens);
+-        w_reshaped = ggml_mul(ctx, w_reshaped, s_reshaped);
+-        weights = ggml_reshape_3d(ctx, w_reshaped, 1, n_expert_used, n_tokens);
+-    }
++        if (down_exps_s && !lctx.cparams.fused_mmad) {
++            GGML_ASSERT(!weight_before_ffn);
++            auto s = ggml_reshape_3d(ctx, down_exps_s, 1, n_expert, 1);
++            s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tokens, 1);
++            s = ggml_get_rows(ctx, s, ids);
++            auto w_reshaped = ggml_reshape_2d(ctx, w, n_expert_used, n_tokens);
++            auto s_reshaped = ggml_reshape_2d(ctx, s, n_expert_used, n_tokens);
++            w_reshaped = ggml_mul(ctx, w_reshaped, s_reshaped);
++            w = ggml_reshape_3d(ctx, w_reshaped, 1, n_expert_used, n_tokens);
++        }
+ 
+-    if (!weight_before_ffn) {
+-        if (lctx.cparams.fused_mmad) {
+-            experts = ggml_mul_multi_add(ctx, experts, weights);
+-            cb(experts, "ffn_moe_weighted", il);
+-            if (down_exps_s) {
+-                experts->src[2] = down_exps_s;
+-                experts->src[3] = selected_experts;
+-            }
+-            if (add_input) {
+-                experts = ggml_add(ctx, experts, input);
+-                cb(experts, "ffn_out_with_inp", il);
++        if (!weight_before_ffn) {
++            if (lctx.cparams.fused_mmad) {
++                experts = ggml_mul_multi_add(ctx, experts, w);
++                cb(experts, "ffn_moe_weighted", il);
++                if (down_exps_s) {
++                    experts->src[2] = down_exps_s;
++                    experts->src[3] = ids;
++                }
++                return experts;
+             }
+-            return experts;
++            experts = ggml_mul(ctx, experts, w);
++            cb(experts, "ffn_moe_weighted", il);
+         }
+-        experts = ggml_mul(ctx, experts, weights);
+-        cb(experts, "ffn_moe_weighted", il);
+-    }
++
++        ggml_tensor * result;
++        if (n_expert_used == 1) {
++            result = ggml_cont(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0));
++        }
++        if (n_expert_used == 2) {
++            result = ggml_add(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0),
++                                 ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], experts->nb[1]));
++        }
++        result = ggml_multi_add(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0), n_expert_used);
++        return result;
++    };
++
++    // Tessera: hot experts (a profile's most used, copied to VRAM at load) run on the GPU, the others on the CPU.
++    // Only for the layer's own expert tensors without per-expert biases or scales.
++    const llama_layer & layer_w = lctx.model.layers[il];
++    const llama_hot_layer * hot = lctx.model.hot_experts && !weight_before_ffn && !up_exps_b && !gate_exps_b &&
++            !down_exps_b && !up_gate_exps_b && !down_exps_s && il >= 0 && il < (int) lctx.model.layers.size() &&
++            up_exps == layer_w.ffn_up_exps && gate_exps == layer_w.ffn_gate_exps &&
++            down_exps == layer_w.ffn_down_exps && up_gate_exps == layer_w.ffn_up_gate_exps
++            ? lctx.model.hot_experts->layer(il) : nullptr;
+ 
+     ggml_tensor * result;
+-    if (n_expert_used == 1) {
+-        result = ggml_cont(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0));
+-    }
+-    if (n_expert_used == 2) {
+-        result = ggml_add(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0),
+-                             ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], experts->nb[1]));
++    if (!hot) {
++        if (lctx.expert_cache) {
++            // Make the selected experts resident before any expert matmul reads them.
++            selected_experts = llama_expert_cache_wrap(ctx, lctx.expert_cache.get(), il, selected_experts,
++                    {up_exps, gate_exps, down_exps, up_gate_exps});
++        }
++        result = moe_part(up_exps, gate_exps, down_exps, up_gate_exps, selected_experts, weights);
++    } else {
++        // The CPU half's ids are remapped first, with its activations and weights as inputs, so all three reach
++        // the host before the GPU half is queued: the GPU then computes the hot experts while the CPU computes the
++        // rest. Each half skips the other's experts (id -1).
++        ggml_tensor * ids_cold = llama_hot_ids(ctx, *hot, selected_experts, false, cur, weights);
++        ggml_tensor * ids_hot  = llama_hot_ids(ctx, *hot, selected_experts, true);
++        if (graph) {
++            ggml_build_forward_expand(graph, ids_cold);
++            ggml_build_forward_expand(graph, ids_hot);
++        }
++        ggml_tensor * hot_out = moe_part(hot->up, hot->gate, hot->down, hot->up_gate, ids_hot, weights);
++        cb(hot_out, "ffn_moe_hot", il);
++        if (graph) {
++            ggml_build_forward_expand(graph, hot_out);
++        }
++        if (lctx.expert_cache) {
++            ids_cold = llama_expert_cache_wrap(ctx, lctx.expert_cache.get(), il, ids_cold,
++                    {up_exps, gate_exps, down_exps, up_gate_exps});
++        }
++        ggml_tensor * cold_out = moe_part(up_exps, gate_exps, down_exps, up_gate_exps, ids_cold, weights);
++        cb(cold_out, "ffn_moe_cold", il);
++        result = ggml_add(ctx, hot_out, cold_out);
+     }
+-    result = ggml_multi_add(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0), n_expert_used);
+     if (add_input) {
+         cb(result, "ffn_out", il);
+         result = ggml_add(ctx, result, input);
+diff --git a/src/llama-hot-experts.cpp b/src/llama-hot-experts.cpp
+new file mode 100644
+index 00000000..f96d553a
+--- /dev/null
++++ b/src/llama-hot-experts.cpp
+@@ -0,0 +1,262 @@
++#include "llama-hot-experts.h"
++
++#include "llama-impl.h"
++#include "llama-model.h"
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++#include <unordered_set>
++
++llama_hot_experts::~llama_hot_experts() {
++    if (buf) ggml_backend_buffer_free(buf);
++    if (ctx) ggml_free(ctx);
++}
++
++namespace {
++
++// The layer's routed-expert weight tensors, in the order the hot copies are stored.
++struct expert_tensors {
++    ggml_tensor * up = nullptr, * gate = nullptr, * down = nullptr, * up_gate = nullptr;
++    // bytes of one expert across all of them; 0 if the layer cannot be split
++    size_t expert_bytes() const {
++        size_t b = 0;
++        for (ggml_tensor * t : {up, gate, down, up_gate}) {
++            if (t) b += t->nb[2];
++        }
++        return b;
++    }
++};
++
++bool splittable(const ggml_tensor * t, int64_t n_expert) {
++    // host memory (-ot exps=CPU), one plain 3D tensor per layer (no multi-GPU split), experts contiguous
++    return t && t->buffer && ggml_backend_buffer_is_host(t->buffer) && !t->extra && t->data && t->ne[2] == n_expert &&
++           t->ne[3] == 1 && ggml_is_contiguous(t);
++}
++
++expert_tensors layer_tensors(const llama_layer & l, int64_t n_expert) {
++    expert_tensors t;
++    if (!l.ffn_down_exps || !splittable(l.ffn_down_exps, n_expert)) return t;
++    if (l.ffn_up_gate_exps) {
++        if (!splittable(l.ffn_up_gate_exps, n_expert) || l.ffn_up_exps || l.ffn_gate_exps) return t;
++        t.up_gate = l.ffn_up_gate_exps;
++    } else {
++        if (!splittable(l.ffn_up_exps, n_expert) || !splittable(l.ffn_gate_exps, n_expert)) return t;
++        t.up = l.ffn_up_exps;
++        t.gate = l.ffn_gate_exps;
++    }
++    // biased or scaled experts would need their per-expert extras remapped too: not split
++    if (l.ffn_up_exps_b || l.ffn_gate_exps_b || l.ffn_down_exps_b || l.ffn_up_gate_exps_b || l.ffn_down_exps_s) return t;
++    t.down = l.ffn_down_exps;
++    return t;
++}
++
++void strided_ids(const ggml_tensor * a, std::vector<int32_t> & out) {
++    out.clear();
++    for (int64_t i3 = 0; i3 < a->ne[3]; ++i3)
++    for (int64_t i2 = 0; i2 < a->ne[2]; ++i2)
++    for (int64_t i1 = 0; i1 < a->ne[1]; ++i1)
++    for (int64_t i0 = 0; i0 < a->ne[0]; ++i0) {
++        out.push_back(*(const int32_t *) ((const char *) a->data + i0 * a->nb[0] + i1 * a->nb[1] + i2 * a->nb[2] +
++                                          i3 * a->nb[3]));
++    }
++}
++
++// dst (contiguous, same shape as a) = the remapped ids; userdata = the layer, sign of the pointer's tag = which half
++template <bool hot>
++void remap_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, const llama_hot_layer & hl) {
++    (void) nth;
++    if (ith != 0) return;
++    static thread_local std::vector<int32_t> ids;
++    strided_ids(a, ids);
++    int32_t * out = (int32_t *) dst->data;
++    const int32_t n = (int32_t) hl.hot_of.size();
++    for (size_t i = 0; i < ids.size(); ++i) {
++        const int32_t e = ids[i];
++        const int32_t h = e >= 0 && e < n ? hl.hot_of[e] : -1;
++        out[i] = hot ? h : (h >= 0 ? -1 : e);
++    }
++}
++
++void remap_hot1(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
++    remap_op<true>(dst, a, ith, nth, *(const llama_hot_layer *) ud);
++}
++void remap_cold1(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
++    remap_op<false>(dst, a, ith, nth, *(const llama_hot_layer *) ud);
++}
++void remap_hot2(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor *, int ith, int nth, void * ud) {
++    remap_op<true>(dst, a, ith, nth, *(const llama_hot_layer *) ud);
++}
++void remap_cold2(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor *, int ith, int nth, void * ud) {
++    remap_op<false>(dst, a, ith, nth, *(const llama_hot_layer *) ud);
++}
++void remap_hot3(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor *, const ggml_tensor *, int ith, int nth,
++                void * ud) {
++    remap_op<true>(dst, a, ith, nth, *(const llama_hot_layer *) ud);
++}
++void remap_cold3(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor *, const ggml_tensor *, int ith, int nth,
++                 void * ud) {
++    remap_op<false>(dst, a, ith, nth, *(const llama_hot_layer *) ud);
++}
++
++// ---- routing trace
++
++struct routing_trace {
++    std::mutex mu;
++    FILE * f = nullptr;
++    ~routing_trace() { if (f) fclose(f); }
++};
++
++routing_trace * trace_file() {
++    static routing_trace * t = [] {
++        const char * path = std::getenv("TESSERA_ROUTING_TRACE");
++        if (!path || !*path) return (routing_trace *) nullptr;
++        auto * r = new routing_trace();   // lives for the process
++        r->f = std::fopen(path, "ab");
++        if (!r->f) {
++            LLAMA_LOG_WARN("%s: cannot open %s for the routing trace\n", __func__, path);
++            delete r;
++            return (routing_trace *) nullptr;
++        }
++        LLAMA_LOG_INFO("%s: writing the routing trace to %s\n", __func__, path);
++        return r;
++    }();
++    return t;
++}
++
++void trace_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
++    (void) nth;
++    if (ith != 0) return;
++    static thread_local std::vector<int32_t> ids;
++    strided_ids(a, ids);
++    std::memcpy(dst->data, ids.data(), ids.size() * sizeof(int32_t));
++    routing_trace * t = trace_file();
++    if (!t) return;
++    const int32_t head[3] = {(int32_t) (intptr_t) ud, (int32_t) (a->ne[1] * a->ne[2] * a->ne[3]), (int32_t) a->ne[0]};
++    std::lock_guard<std::mutex> lk(t->mu);
++    std::fwrite(head, sizeof(head), 1, t->f);
++    std::fwrite(ids.data(), sizeof(int32_t), ids.size(), t->f);
++}
++
++} // namespace
++
++std::shared_ptr<llama_hot_experts> llama_hot_experts_load(const llama_model & model, const std::string & profile,
++                                                          size_t budget_bytes, std::string & err) {
++    const int64_t n_layer = (int64_t) model.layers.size();
++    const int64_t n_expert = model.hparams.n_expert;
++    if (n_expert <= 0) { err = "the model has no routed experts"; return nullptr; }
++
++    std::ifstream in(profile);
++    if (!in) { err = "cannot open the profile " + profile; return nullptr; }
++    std::vector<std::pair<int32_t, int32_t>> ranked;
++    std::unordered_set<int64_t> seen;
++    std::string line;
++    while (std::getline(in, line)) {
++        const size_t hash = line.find('#');
++        if (hash != std::string::npos) line.resize(hash);
++        std::istringstream fields(line);
++        int64_t l, e;
++        if (!(fields >> l >> e)) continue;
++        if (l < 0 || l >= n_layer || e < 0 || e >= n_expert || !seen.insert(l * n_expert + e).second) continue;
++        ranked.emplace_back((int32_t) l, (int32_t) e);
++    }
++    if (ranked.empty()) { err = "the profile " + profile + " names no expert of this model"; return nullptr; }
++
++    // take pairs in rank order while they fit
++    std::vector<expert_tensors> lt(n_layer);
++    for (int64_t l = 0; l < n_layer; ++l) lt[l] = layer_tensors(model.layers[l], n_expert);
++    auto hot = std::make_shared<llama_hot_experts>();
++    hot->layers.resize(n_layer);
++    std::vector<std::vector<int32_t>> chosen(n_layer);
++    size_t used = 0;
++    for (const auto & [l, e] : ranked) {
++        const size_t b = lt[l].expert_bytes();
++        if (b == 0 || used + b > budget_bytes) continue;
++        chosen[l].push_back(e);
++        used += b;
++    }
++    if (used == 0) {
++        err = "no expert tensor is in host memory (use -ot exps=CPU), or the budget holds no expert";
++        return nullptr;
++    }
++
++    // one tensor per layer and kind, [ne0, ne1, n_hot], in the main GPU's buffer type
++    ggml_init_params ip = { (size_t) (4 * n_layer + 1) * ggml_tensor_overhead(), nullptr, true };
++    hot->ctx = ggml_init(ip);
++    if (!hot->ctx) { err = "ggml_init failed"; return nullptr; }
++    for (int64_t l = 0; l < n_layer; ++l) {
++        if (chosen[l].empty()) continue;
++        llama_hot_layer & hl = hot->layers[l];
++        hl.n_hot = (int32_t) chosen[l].size();
++        auto dup = [&](ggml_tensor * src, const char * kind) -> ggml_tensor * {
++            if (!src) return nullptr;
++            ggml_tensor * t = ggml_new_tensor_3d(hot->ctx, src->type, src->ne[0], src->ne[1], hl.n_hot);
++            ggml_format_name(t, "blk.%d.%s.hot", (int) l, kind);
++            return t;
++        };
++        hl.up      = dup(lt[l].up, "ffn_up_exps");
++        hl.gate    = dup(lt[l].gate, "ffn_gate_exps");
++        hl.down    = dup(lt[l].down, "ffn_down_exps");
++        hl.up_gate = dup(lt[l].up_gate, "ffn_up_gate_exps");
++    }
++    const int dev = model.devices.empty() ? model.main_gpu
++                                          : model.devices[std::clamp(model.main_gpu, 0, (int) model.devices.size() - 1)];
++    ggml_backend_buffer_type_t buft = model.default_buffer_type_offload(dev);
++    hot->buf = ggml_backend_alloc_ctx_tensors_from_buft(hot->ctx, buft);
++    if (!hot->buf) {
++        err = "cannot allocate " + std::to_string(used >> 20) + " MiB for the hot experts in " + ggml_backend_buft_name(buft);
++        return nullptr;
++    }
++    ggml_backend_buffer_set_usage(hot->buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    for (int64_t l = 0; l < n_layer; ++l) {
++        llama_hot_layer & hl = hot->layers[l];
++        if (hl.n_hot == 0) continue;
++        hl.hot_of.assign((size_t) n_expert, -1);
++        std::sort(chosen[l].begin(), chosen[l].end());   // file order: sequential reads while copying
++        for (int32_t h = 0; h < hl.n_hot; ++h) {
++            const int32_t e = chosen[l][h];
++            hl.hot_of[e] = h;
++            const std::pair<ggml_tensor *, ggml_tensor *> copies[] = {
++                {lt[l].up, hl.up}, {lt[l].gate, hl.gate}, {lt[l].down, hl.down}, {lt[l].up_gate, hl.up_gate}};
++            for (const auto & [src, dst] : copies) {
++                if (!src) continue;
++                ggml_backend_tensor_set(dst, (const char *) src->data + (size_t) e * src->nb[2],
++                                        (size_t) h * dst->nb[2], src->nb[2]);
++            }
++        }
++        hot->n_hot += hl.n_hot;
++    }
++    hot->bytes = used;
++    int layers_split = 0;
++    for (const auto & hl : hot->layers) layers_split += hl.n_hot > 0;
++    LLAMA_LOG_INFO("%s: %lld hot experts (%.2f GiB) in %s over %d layers, from %s\n", __func__,
++                   (long long) hot->n_hot, used / 1073741824.0, ggml_backend_buft_name(buft), layers_split,
++                   profile.c_str());
++    return hot;
++}
++
++ggml_tensor * llama_hot_ids(ggml_context * ctx, const llama_hot_layer & hl, ggml_tensor * ids, bool hot,
++                            ggml_tensor * dep0, ggml_tensor * dep1) {
++    void * ud = const_cast<llama_hot_layer *>(&hl);   // the ops only read it
++    ggml_tensor * out;
++    if (dep0 && dep1) {
++        out = ggml_map_custom3(ctx, ids, dep0, dep1, hot ? remap_hot3 : remap_cold3, 1, ud);
++    } else if (dep0) {
++        out = ggml_map_custom2(ctx, ids, dep0, hot ? remap_hot2 : remap_cold2, 1, ud);
++    } else {
++        out = ggml_map_custom1(ctx, ids, hot ? remap_hot1 : remap_cold1, 1, ud);
++    }
++    return out;
++}
++
++ggml_tensor * llama_routing_trace_wrap(ggml_context * ctx, int il, ggml_tensor * ids) {
++    if (!trace_file()) return ids;
++    return ggml_map_custom1(ctx, ids, trace_op, 1, (void *) (intptr_t) il);
++}
+diff --git a/src/llama-hot-experts.h b/src/llama-hot-experts.h
+new file mode 100644
+index 00000000..a45c8bcd
+--- /dev/null
++++ b/src/llama-hot-experts.h
+@@ -0,0 +1,64 @@
++#pragma once
++
++// Hot experts: a static copy of the most-used MoE experts in VRAM (Tessera, after Strata's VRAM expert cache).
++//
++// With the expert tensors on the CPU (-ot exps=CPU / --cpu-moe) every routed expert is computed by the CPU from
++// RAM. Routing is uneven, so a few thousand experts carry most of the traffic. At load time the experts named by
++// a profile (most-used first) are copied into VRAM until a budget is used up. Each MoE layer then splits its
++// routed experts by id:
++//   * the hot ones run on the GPU from the copies (the CPU's ids for them are -1),
++//   * the rest run on the CPU from RAM (the GPU's ids for them are -1),
++// and the two partial sums are added. The GPU half is queued first and the CPU half's inputs are copied to the
++// host before it, so both halves run at the same time. Kernels skip id -1 already (it is how -ser drops experts).
++//
++// Profile format: text, one "layer expert" pair per line, most used first; '#' starts a comment.
++// tools/make_profile.py in Tessera writes it from routing traces (TESSERA_ROUTING_TRACE below).
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++struct ggml_context;
++struct ggml_tensor;
++struct ggml_backend_buffer;
++struct llama_model;
++
++struct llama_hot_layer {
++    // the hot experts' slices of the layer's expert tensors, [.., .., n_hot], in VRAM (null when absent)
++    ggml_tensor * up      = nullptr;
++    ggml_tensor * gate    = nullptr;
++    ggml_tensor * down    = nullptr;
++    ggml_tensor * up_gate = nullptr;
++    std::vector<int32_t> hot_of;   // per expert: its index in the hot tensors, or -1
++    int32_t n_hot = 0;
++};
++
++struct llama_hot_experts {
++    std::vector<llama_hot_layer> layers;   // per model layer; n_hot == 0: the layer is not split
++    ggml_context * ctx = nullptr;
++    ggml_backend_buffer * buf = nullptr;
++    size_t bytes = 0;
++    int64_t n_hot = 0;
++    ~llama_hot_experts();
++
++    const llama_hot_layer * layer(int il) const {
++        return il >= 0 && il < (int) layers.size() && layers[il].n_hot > 0 ? &layers[il] : nullptr;
++    }
++};
++
++// Copies the profile's experts (most used first) into the model's main GPU until `budget_bytes` is used.
++// Returns nullptr (and sets `err`) when nothing could be placed; the model then runs unchanged.
++std::shared_ptr<llama_hot_experts> llama_hot_experts_load(const llama_model & model, const std::string & profile,
++                                                          size_t budget_bytes, std::string & err);
++
++// Graph helper: the routed ids remapped for one half of the split. hot = true: indices into the hot tensors, -1 for
++// the others; hot = false: the original ids, -1 for the hot ones. `deps` are only inputs, so that the scheduler copies
++// them to the host in the same split (before the GPU half is queued): pass what the CPU half reads.
++ggml_tensor * llama_hot_ids(ggml_context * ctx, const llama_hot_layer & hl, ggml_tensor * ids, bool hot,
++                            ggml_tensor * dep0 = nullptr, ggml_tensor * dep1 = nullptr);
++
++// Routing trace: with TESSERA_ROUTING_TRACE=<file>, every MoE layer appends its routed ids to <file>
++// (records: int32 layer, int32 n_tokens, int32 k, then n_tokens * k int32 ids). Returns `ids` unchanged when off.
++ggml_tensor * llama_routing_trace_wrap(ggml_context * ctx, int il, ggml_tensor * ids);
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 34fcbe45..31f70c06 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -634,6 +634,7 @@ struct llama_model {
+     // The expert cache remaps this model's expert memory, so it is shared by every
+     // context on the model (see llama-expert-cache.h).
+     mutable std::weak_ptr<struct llama_expert_cache> expert_cache;
++    std::shared_ptr<struct llama_hot_experts> hot_experts; // Tessera: most-used experts copied to VRAM
+ 
+     // objects representing data potentially being locked in memory
+     llama_mlocks mlock_bufs;
+diff --git a/src/llama.cpp b/src/llama.cpp
+index def4724e..aaaa3180 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -11,6 +11,7 @@
+ #include <unistd.h>
+ #endif
+ #include "llama-vocab.h"
++#include "llama-hot-experts.h"
+ #include "llama-grammar.h"
+ #include "llama-sampling.h"
+ #include "llama-arch.h"
+@@ -5380,6 +5381,14 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
+             return -2;
+         }
+ 
++        if (params.hot_experts && params.hot_experts[0] && params.hot_experts_mib > 0 && !params.dry_run) {
++            std::string hot_err;
++            model.hot_experts = llama_hot_experts_load(model, params.hot_experts, (size_t) params.hot_experts_mib << 20, hot_err);
++            if (!model.hot_experts) {
++                LLAMA_LOG_WARN("%s: hot experts disabled: %s\n", __func__, hot_err.c_str());
++            }
++        }
++
+         const enum llama_mtp_package mtp_package = llama_model_mtp_package(&model);
+         if (mtp_package == LLAMA_MTP_PACKAGE_INVALID) {
+             throw std::runtime_error("invalid MTP package: missing target trunk and predictor tail tensors");
+@@ -8536,6 +8545,8 @@ struct llama_model_params llama_model_default_params() {
+         /*.progress_callback_user_data =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
+         /*.tensor_buft_overrides       =*/ nullptr,
++        /*.hot_experts                 =*/ nullptr,
++        /*.hot_experts_mib             =*/ 0,
+         /*.vocab_only                  =*/ false,
+         /*.use_mmap                    =*/ true,
+         /*.use_mlock                   =*/ false,

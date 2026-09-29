@@ -6,6 +6,45 @@ Read this first when resuming on another machine. It records the goal,
 everything built and measured so far, what was learned, and the exact plan for
 the next piece of work.
 
+## 0. Latest (2026-09-29 evening): the GPU is in play, and Tessera
+
+**The target changed.** The user's PC has an RTX 4070 (12 GB) next to the i5-13400F,
+32 GB DDR4-3200 and a 1 TB PCIe 3.0 NVMe (1.5 GB/s sequential, 1.0 GB/s for 1 MB
+random reads, measured with winsat). With a GPU, the question is no longer
+CPU-only.
+
+**Strata, measured on that PC.** [Strata](https://github.com/Niko1221/Strata) runs
+Qwen3.8-Flash-Next (125B MoE) with the busiest experts in VRAM and the rest on
+the CPU.
+- Its Coder variant (fits 32 GB) runs unchanged at 38.8 tok/s in calibration and
+  **29-31 tok/s in real chat** with thinking off (`--pcie-frac 0.20`, 9 CPU workers).
+- The general model needs more than 32 GB of RAM, so an SSD tier was started in the
+  fork `cvladioan/Strata` (branch `claude/modest-goodall-ryj2y7`): a tested `ColdExperts`
+  component, not wired in yet.
+
+**Tessera ([`tessera/`](../tessera/README.md)).** The user then asked for a new
+engine built the way Strata is, for any MoE model.
+- **Engine:** ik_llama.cpp plus the expert cache patches and a new
+  `0003-hot-experts.patch`:
+  - a profile's most-used experts are copied to VRAM;
+  - each MoE layer computes those on the GPU and the rest on the CPU, at the same
+    time (id remap ops; kernels skip id -1).
+- **Tooling:** routing traces, a profile builder, a memory planner with a speed model,
+  calibration, serving and benchmark scripts, and WSL2 setup (CUDA from NVIDIA's WSL
+  repository, since Ubuntu's package pulls a Linux driver library).
+- **Verified:** outputs match the plain engine in every configuration (CPU-only test,
+  `tessera/tests/run_tests.sh`). A deliberately wrong mapping is caught. The changed
+  files compile with CUDA 12.0 for sm_89.
+- **Not verified yet:** the first GPU run on the PC (speed, GPU/CPU overlap).
+- **Estimates** (`tessera/docs/PLAN.md`):
+  - Qwen3.6-35B-A3B Q6_K ~50 tok/s;
+  - Qwen3-Next-80B-A3B Q3_K_XL ~30 tok/s, 45-55 with speculative decoding;
+  - dense 70B ~2 tok/s (bandwidth-bound).
+- **Next:**
+  1. Run the Quick start in `tessera/README.md` on the PC.
+  2. Run `scripts/bench.sh` and fix what the first GPU run shows.
+  3. Then the adaptive hot set and speculative decoding (Tessera plan, phases 3-4).
+
 ## 1. The goal
 
 Run big Mixture-of-Experts (MoE) models, DeepSeek-V4-Flash first, on **common
@@ -353,4 +392,6 @@ git checkout d741de5074cd424dd3ba7cfc4d9b7649f1eb0463
 
 If you continue with Claude Code, point it at this file:
 
-> Read docs/HANDOFF.md, docs/BOTTLENECKS.md and docs/EXPERT_CACHE.md, then continue with R2 (cache-aware routing) from section 7b, built on the expert cache.
+> Read docs/HANDOFF.md (section 0 first), tessera/README.md and tessera/docs/PLAN.md. On the user's PC (WSL2, RTX 4070): run the Tessera quick start, then scripts/bench.sh, and fix whatever the first GPU run shows. Commit results to tessera/docs/ on branch claude/modest-goodall-ryj2y7.
+
+The CPU-only research line (R2 cache-aware routing, section 7b) is on hold.

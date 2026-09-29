@@ -1,0 +1,3 @@
+# local settings (may hold an API key)
+tessera.env
+__pycache__/
