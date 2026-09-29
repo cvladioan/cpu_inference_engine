@@ -147,9 +147,13 @@ llama-server -m model.gguf --defer-experts --expert-cache 18000 ...
 LLAMA_EXPERT_CACHE_LOG=2000 llama-server ...   # log hit rate every 2000 layer calls; always logged at exit
 ```
 
-**Sizing:** the cache's memory cannot be reclaimed by the OS. A budget that
-leaves too little free RAM gets the process (or another one) killed by the
-out-of-memory killer, so size conservatively. Auto sizing does.
+**Sizing:** the OS cannot drop the cache's memory the way it drops page cache.
+A budget that leaves too little free RAM gets the process (or another one)
+killed by the out-of-memory killer, so size conservatively. Auto sizing does.
+
+**Swap:** the cache memory is not locked. With swap enabled the kernel may
+swap cached experts out, which is slower than re-reading them from the model
+file. Turn swap off (`sudo swapoff -a`) on machines that stream experts.
 
 ## 7. Limitations and next steps
 

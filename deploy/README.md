@@ -344,7 +344,7 @@ for a single run, for example `PARALLEL=8 deploy/serve.sh`.
 | `PARALLEL` | `4` | Concurrent requests per server. More gives more total throughput but a slower stream per user (table in `docs/PLAN.md` section 8). |
 | `CTX_PER_SLOT` | `32768` | Longest conversation per request. The total context is `PARALLEL x CTX_PER_SLOT`. |
 | `CACHE_RAM_MIB` | `32768` | RAM for reusing earlier prompts, which lowers time to first token for chats and agents. Raise it if RAM allows. |
-| `EXPERT_CACHE_MIB` | `auto` | When streaming, the engine-managed expert cache (docs/EXPERT_CACHE.md), 4-6x faster than the OS page cache. `auto` sizes it from free RAM; `0` switches back to the page cache. Its memory cannot be reclaimed or swapped out, so lower `EXPERT_CACHE_HEADROOM_MIB` (default 2048) only if you know the machine's memory well. |
+| `EXPERT_CACHE_MIB` | `auto` | When streaming, the engine-managed expert cache (docs/EXPERT_CACHE.md), 4-6x faster than the OS page cache. `auto` sizes it from free RAM; `0` switches back to the page cache. The OS cannot drop its memory like page cache (and with swap on it may swap it out, so turn swap off when streaming), so lower `EXPERT_CACHE_HEADROOM_MIB` (default 2048) only if you know the machine's memory well. |
 | `EXPERT_STREAMING` | `auto` | `auto` streams experts from SSD only when the model does not fit in RAM. `off` always loads the whole model into RAM, which fails or swaps if it does not fit; `on` forces streaming. |
 | `THREADS` | physical cores | Leave empty unless benchmarks say otherwise; never count hyperthreads. |
 | `SPEC_TYPE` | off | Try `mtp:n_max=1` (speculative decoding with the model's built-in draft head). Keep it only if `smoke_test.py` shows higher tok/s. |
