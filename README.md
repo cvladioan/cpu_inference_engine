@@ -3,7 +3,9 @@
 Run large Mixture-of-Experts models on CPU-only x86 servers, with no GPUs.
 The first target is DeepSeek-V4-Flash (284B total, 13B active).
 
-- [`deploy/`](deploy/README.md): **start here.** Serves DeepSeek-V4-Flash today
+- [`docs/HANDOFF.md`](docs/HANDOFF.md): current status, research findings and
+  next steps. Read this first when resuming work.
+- [`deploy/`](deploy/README.md): **start here to run a model.** Serves DeepSeek-V4-Flash today
   with ik_llama.cpp behind an OpenAI-compatible API. Includes host checks,
   build, model download, NUMA-aware launch, benchmarks and a systemd service.
 - [`docs/PLAN.md`](docs/PLAN.md): research, hardware sizing, performance
