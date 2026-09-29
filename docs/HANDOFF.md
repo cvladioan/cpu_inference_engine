@@ -52,7 +52,12 @@ The work in progress (section 7) targets (b), then (a).
 |---|---|
 | `docs/PLAN.md` | Research plan: models, hardware sizing, engine architecture, roadmap, risks. Section 12 covers the SSD memory tier. |
 | `docs/HANDOFF.md` | This file |
+| `docs/BOTTLENECKS.md` | **Measured analysis of what blocks big models on common CPUs**: blockers ranked, time budget per token, research agenda |
 | `tools/roofline.py` | Bandwidth roofline calculator: decode tok/s per hardware and quant, batching, MTP, SSD streaming, `--target-tps` |
+| `tools/engine_profile.py` | Runs the measurements on any machine: DRAM bandwidth, decode efficiency, prefill GFLOP/s, per-layer overhead |
+| `tools/membw.c` | DRAM read-bandwidth benchmark per thread count |
+| `tools/ram_limit.py` | Holds RAM to emulate a smaller-RAM PC (forces SSD streaming) |
+| `tools/expert_pin.py` | Prototype: pins non-expert weights plus a budget of experts in the page cache with `mlock`; no engine changes |
 | `deploy/` | Working deployment of DeepSeek-V4-Flash on ik_llama.cpp. Runbook: `deploy/README.md` |
 | `deploy/check_host.sh` | Host readiness check: CPU ISA, RAM, DIMMs, NUMA, disk/NVMe, WSL `.wslconfig` |
 | `deploy/build.sh` | Builds ik_llama.cpp at the pinned commit (`-march=native`) |
@@ -153,7 +158,52 @@ Sources are in `docs/PLAN.md` section 13; new ones are listed below.
 - The model is kept memory-mapped (never `--mlock`) when streaming experts.
   Prompt batches are 2048 tokens when streaming.
 
-## 7. In progress: Cache-Aware Routing (CAR)
+## 7. Bottleneck analysis (done 2026-09-29) and the next step
+
+The full write-up is in `docs/BOTTLENECKS.md`; every number there was
+measured in this session. Key findings:
+
+- **Page-cache cliff.** With free RAM close to the model size, SSD-streamed
+  decode fell from 13.9 to 0.4 tok/s. The engine read 2.75 GB per token,
+  twice all the weights a token uses.
+  - Cause: least-recently-used eviction under the fixed layer order, plus
+    read-ahead. The prefetcher is not the cause: plain `mmap` behaves the
+    same.
+  - **This is the largest software-fixable loss.**
+- **Pinning prototype** (`tools/expert_pin.py`): non-expert weights plus 30%
+  of experts **doubled** tok/s (0.4 to 0.8) and cut reads 45%. Over-pinning
+  hurts once the cache has room (1.3 to 1.1 tok/s at 4.6 GB free), so the
+  real fix is an adaptive cache.
+- **Engine efficiency:** 49-54% of DRAM bandwidth at 4-bit, 59-68% at 8-bit.
+  4-bit is compute-bound per core. `-rtr` adds 11%.
+- **Per-layer overhead:** 28-36 µs on 1 thread, 43-45 µs on 2-4 threads.
+  Threads hurt on tiny layers.
+- **Prefill:** 470-520 GFLOP/s on 4 cores, about 15% of int8 peak. That means
+  about 18-25 tok/s prompt speed for V4-Flash on a desktop.
+- **Bandwidth:** about 9 GB/s per core, scaling linearly to 34.6 GB/s on 4
+  cores.
+
+**Revised order of work:**
+1. **R1: explicit expert cache.** It replaces the page cache for expert
+   weights:
+   - non-expert weights always resident
+   - a frequency-aware, scan-resistant pool of whole experts
+   - exact-slice reads, no read-ahead
+
+   Test bed: the same VM, with `tools/ram_limit.py` and the V4-shaped Q8_0
+   model. Target: at least 3x tok/s at the tight memory level.
+2. **R2: Cache-Aware Routing** (below) on top of R1.
+3. **R3:** predictive prefetch.
+4. **R4:** fewer bytes per token.
+
+Test models are not stored in the repo. Regenerate them with:
+
+```bash
+python3 deploy/test/make_tiny_gguf.py --embd 4096 --ff 2048 --experts 16 --used 4 --layers 8 --heads 32 f32.gguf
+llama-quantize --pure f32.gguf v4like-Q8_0.gguf Q8_0      # 3.8 GB; each token uses 0.53 GB non-expert + 0.86 GB experts
+```
+
+## 7b. Planned: Cache-Aware Routing (CAR)
 
 **Idea (training-free, runtime-only, works on any MoE GGUF):**
 - On a common PC, most experts live on the SSD. Each cache miss costs a slow
@@ -287,4 +337,4 @@ git checkout d741de5074cd424dd3ba7cfc4d9b7649f1eb0463
 
 If you continue with Claude Code, point it at this file:
 
-> Read docs/HANDOFF.md and continue with section 7 (Cache-Aware Routing).
+> Read docs/HANDOFF.md and docs/BOTTLENECKS.md, then continue with R1 (explicit expert cache) from section 7.

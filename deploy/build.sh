@@ -24,7 +24,7 @@ log "ik_llama.cpp at $(git -C "$src" log -1 --format='%h %cs %s')"
 cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_CUDA=OFF \
     -DLLAMA_CURL=OFF
 cmake --build "$src/build" --config Release -j"$(nproc)" \
-    --target llama-server llama-sweep-bench llama-bench llama-cli
+    --target llama-server llama-sweep-bench llama-bench llama-cli llama-quantize
 
 # Confirm the fast quantized kernels were compiled in (see ik_llama.cpp docs/build.md).
 if grep -qw -E 'avx512_vnni|avx_vnni' /proc/cpuinfo; then

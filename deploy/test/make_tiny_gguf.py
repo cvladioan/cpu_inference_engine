@@ -8,10 +8,13 @@ Standard library only.
 
     python3 deploy/test/make_tiny_gguf.py /tmp/tiny.gguf
     python3 deploy/test/make_tiny_gguf.py --size-gb 20 /data/moe20.gguf
+    python3 deploy/test/make_tiny_gguf.py --embd 4096 --ff 2048 --experts 16 --used 4 --layers 8 /data/v4like.gguf
 
 --size-gb writes a Mixture-of-Experts model of about that size instead. Make
 it larger than RAM to exercise SSD expert streaming (EXPERT_STREAMING).
-Expert weights repeat one random block so tens of GB are written quickly.
+The shape flags build a MoE of any shape, e.g. DeepSeek-V4-Flash-sized experts
+for performance studies (tools/engine_profile.py). Large tensors repeat one
+random block so tens of GB are written quickly.
 """
 
 import argparse
@@ -74,27 +77,32 @@ def vocab():
     return tokens, types, scores
 
 
-def build(size_gb):
+def build(size_gb, shape=None):
     """Return (hyperparameters, tensors). Tensors are (name, ggml dims, data)."""
     rng = random.Random(0)
+    block = array("f", (rng.gauss(0.0, 0.05) for _ in range(1 << 18)))  # 1 MB reused for large tensors
 
     def rand(n, scale=0.05):
+        if n > 1 << 20:
+            return Repeat(block, n)
         return array("f", (rng.gauss(0.0, scale) for _ in range(n)))
 
     def ones(n):
         return array("f", [1.0] * n)
 
-    if size_gb:
-        # 64 experts, 4 active: each layer holds 3 x 64 x 1024 x 1024 fp32 = 805 MB of experts.
-        hp = dict(n_embd=1024, n_ff=1024, n_head=8, n_expert=64, n_expert_used=4)
-        per_layer = 3 * hp["n_expert"] * hp["n_embd"] * hp["n_ff"] * 4
-        hp["n_layer"] = max(1, math.ceil(size_gb * 1e9 / per_layer))
+    shape = {k: v for k, v in (shape or {}).items() if v}
+    if size_gb or shape:
+        # Default: 64 experts, 4 active; each layer holds 3 x 64 x 1024 x 1024 fp32 = 805 MB of experts.
+        hp = dict(n_embd=1024, n_ff=1024, n_head=8, n_expert=64, n_expert_used=4, n_layer=4)
+        hp.update(shape)
+        if size_gb and "n_layer" not in shape:
+            per_layer = 3 * hp["n_expert"] * hp["n_embd"] * hp["n_ff"] * 4
+            hp["n_layer"] = max(1, math.ceil(size_gb * 1e9 / per_layer))
     else:
         hp = dict(n_embd=256, n_ff=512, n_head=4, n_expert=0, n_expert_used=0, n_layer=2)
     e, ff, nx = hp["n_embd"], hp["n_ff"], hp["n_expert"]
     tokens, _, _ = vocab()
     n_vocab = len(tokens)
-    block = rand(1 << 18)  # 1 MB reused for all expert weights
 
     tensors = [("token_embd.weight", [e, n_vocab], rand(e * n_vocab, 0.5))]
     for i in range(hp["n_layer"]):
@@ -131,9 +139,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path")
     ap.add_argument("--size-gb", type=float, default=0, help="write a MoE model of about this size")
+    ap.add_argument("--embd", type=int, help="hidden size (MoE)")
+    ap.add_argument("--ff", type=int, help="expert intermediate size (MoE)")
+    ap.add_argument("--experts", type=int, help="routed experts per layer (MoE)")
+    ap.add_argument("--used", type=int, help="experts per token (MoE)")
+    ap.add_argument("--layers", type=int, help="number of layers (MoE)")
+    ap.add_argument("--heads", type=int, help="attention heads (MoE)")
     args = ap.parse_args()
 
-    hp, tensors = build(args.size_gb)
+    shape = dict(n_embd=args.embd, n_ff=args.ff, n_expert=args.experts, n_expert_used=args.used,
+                 n_layer=args.layers, n_head=args.heads)
+    hp, tensors = build(args.size_gb, shape)
     tokens, types, scores = vocab()
     kvs = [
         kv("general.architecture", STR, "llama"),
