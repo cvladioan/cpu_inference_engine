@@ -23,7 +23,7 @@ choices and the estimates are in [docs/PLAN.md](docs/PLAN.md).
 These are bandwidth-model estimates; `scripts/bench.sh` measures the real numbers.
 
 **First real run** ([docs/RESULTS.md](docs/RESULTS.md)): Qwen3-Next-80B-A3B UD-Q3_K_XL on an 8-vCPU VM with no GPU
-answers correctly at **15.3 tok/s**.
+answers correctly at **15.3 tok/s** with 6 threads, and **21 tok/s** with all 8.
 
 **Status (v0.1):**
 - The engine change and the tooling are complete.

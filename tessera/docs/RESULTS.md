@@ -33,6 +33,40 @@ explanation).
 **Not exercised here:** the hot experts (no GPU) and the SSD tier (the model fits in RAM). Those need the target
 PC.
 
+### Tuning: threads, batch size, repacking
+
+Measured with `llama-bench -p 1024 -n 32 -r 2` on the same VM and model:
+
+| Threads | `-ub` | `-rtr` | Prompt (pp1024) | Output (tg32) |
+|---|---|---|---|---|
+| 6 | 512 | - | 67.7 tok/s | 17.8 tok/s |
+| **8** | 512 | - | **85.5** | **21.1** |
+| 6 | 2048 | - | 67.9 | 17.9 |
+| 8 | 2048 | - | 86.5 | 21.0 |
+| 8 | 2048 | 1 | 86.2 | 21.8 |
+
+**What this shows:**
+- **Use every vCPU on a VM.** Going from 6 threads to all 8 speeds up prompt processing by 26% and output by 18%.
+- **At 21 tok/s, output uses 91% of the measured RAM bandwidth** (1.95 GB per token). The planner assumes 65%, which
+  matches 6 threads. With all cores it underestimates.
+- **A larger micro-batch does nothing here.** Prompt processing is limited by compute: about 3B active parameters,
+  with the Q3_K dequantization, on 8 AVX2 cores.
+- **Run-time repacking (`-rtr`) gains 3% on output and nothing on prompts.** It also turns off mmap and slows loading,
+  so it is not worth using on this model.
+
+### With a coding agent (pi)
+
+[pi](https://github.com/badlogic/pi-mono) ran on a Windows workstation against this server, with 6 threads, in the
+`models.json` setup from the README. Tool calls work through `--jinja`.
+
+- **First request:** pi's system prompt and tool definitions are 1,423 tokens. They took 22 s (64 tok/s).
+- **Later turns reuse the prompt cache**, so each processes only its new tokens: 16-76 tokens, at 30-46 tok/s (small
+  batches). The hybrid model can reuse the cache because the engine keeps context checkpoints by default (up to 32 per
+  slot, about 75 MiB each).
+- **Output:** 16.5-17.4 tok/s at a 1.4K-3.3K context.
+- **The cost of agent work is reading.** Every file and command output goes through prompt processing, so a 300-line
+  file takes about a minute at 6 threads.
+
 **Implication for the target PC** (RTX 4070, 32 GB DDR4, about 40 GB/s), with the calibrated planner:
 
 | Model | GPU + hot experts | Every expert on the CPU (`--cpu-moe`) | CPU only |
