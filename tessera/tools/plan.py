@@ -101,7 +101,9 @@ def estimate(info, p, gpu_bw, ram_bw, ssd_bw, hit=None):
     if not info["n_expert_used"] or not info["expert_bytes"]:
         return None
     per_tok = info["n_expert_used"] * info["moe_layers"] * info["expert_bytes_per_expert"]
-    cpu_bw = min(ram_bw * 0.6, 22.0) * 1e9    # what the CPU streams while computing quantized weights
+    # What the CPU streams while computing quantized weights: 67% of measured RAM bandwidth for Qwen3-Next-80B
+    # UD-Q3_K_XL on 8 Cascade Lake vCPUs (15.3 tok/s at 44.8 GB/s, docs/RESULTS.md). i-quants decode slower.
+    cpu_bw = ram_bw * 0.65 * 1e9
     if p["cpu_only"]:
         cpu_ms = (info["dense_bytes"] + per_tok) / cpu_bw * 1e3
         ssd_ms = 0.0
