@@ -12,9 +12,12 @@ source "$(dirname "$0")/lib.sh"
 load_config
 
 CUDA_PKG=${CUDA_PKG:-cuda-toolkit-12-8}   # 12.8: also builds for RTX 50 (sm_120)
+cpu_only=0
+[[ "${CPU_ONLY:-auto}" =~ ^(1|yes|true)$ ]] && cpu_only=1
 
-log "checking the GPU"
-if ! nvidia_smi -L; then
+if (( cpu_only )); then
+    log "CPU_ONLY=1: no GPU check, no CUDA toolkit"
+elif ! { log "checking the GPU"; nvidia_smi -L; }; then
     if is_wsl; then
         die "WSL cannot see an NVIDIA GPU: install or update the NVIDIA driver in Windows (not inside WSL), then run 'wsl --shutdown' in PowerShell"
     fi
@@ -25,7 +28,9 @@ log "installing build tools"
 sudo apt-get update -q
 sudo apt-get install -y -q build-essential cmake git python3-venv curl wget ca-certificates
 
-if [[ -x /usr/local/cuda/bin/nvcc ]] || command -v nvcc >/dev/null; then
+if (( cpu_only )); then
+    :
+elif [[ -x /usr/local/cuda/bin/nvcc ]] || command -v nvcc >/dev/null; then
     log "CUDA compiler already installed: $( (command -v nvcc || echo /usr/local/cuda/bin/nvcc) | head -1)"
 else
     log "installing $CUDA_PKG from NVIDIA's repository"

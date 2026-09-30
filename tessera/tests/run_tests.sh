@@ -21,6 +21,8 @@ trap cleanup EXIT
 
 export MODEL_FILE="$work/moe.gguf" PROFILE="$work/moe.profile" PORT=${TEST_PORT:-18290} HOST=127.0.0.1 API_KEY=
 export CTX=1024 THREADS=${THREADS:-4} EXTRA_ARGS=""
+# GPU-style arguments even on a CPU-only build: the hot copies then land in RAM, which tests the split's logic
+export CPU_ONLY=0
 python3 "$here/make_tiny_gguf.py" --embd 256 --ff 128 --experts 16 --used 4 --layers 4 --heads 4 "$MODEL_FILE" >/dev/null
 
 echo "== gguf_info / plan"
@@ -62,6 +64,8 @@ check hot-experts HOT_MIB=2 CACHE_MIB=0
 check hot-all-experts HOT_MIB=64 CACHE_MIB=0
 check hot+ssd-tier HOT_MIB=2 CACHE_MIB=1
 check ssd-tier-only HOT_MIB=0 CACHE_MIB=1
+check cpu-only CPU_ONLY=1 HOT_MIB=2 CACHE_MIB=0
+check cpu-only+ssd-tier CPU_ONLY=1 HOT_MIB=2 CACHE_MIB=1
 
 (( fail == 0 )) || { echo "FAIL"; exit 1; }
 echo "PASS"

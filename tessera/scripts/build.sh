@@ -42,6 +42,7 @@ fi
 nvcc=$(command -v nvcc || true)
 [[ -z "$nvcc" && -x /usr/local/cuda/bin/nvcc ]] && nvcc=/usr/local/cuda/bin/nvcc
 cuda=${CUDA:-auto}
+[[ "${CPU_ONLY:-auto}" =~ ^(1|yes|true)$ ]] && cuda=0
 [[ "$cuda" == auto ]] && cuda=$([[ -n "$nvcc" ]] && echo 1 || echo 0)
 args=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DGGML_NATIVE=ON)
 if [[ "$cuda" == 1 ]]; then

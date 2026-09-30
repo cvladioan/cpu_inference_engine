@@ -10,6 +10,7 @@ Tessera's tiers (docs/PLAN.md):
     python3 tessera/tools/plan.py model.gguf                      # detects VRAM (nvidia-smi) and free RAM
     python3 tessera/tools/plan.py model.gguf --vram-gib 12 --ram-gib 26 --ctx 32768 --estimate
     python3 tessera/tools/plan.py model.gguf --env                # KEY=VALUE lines for scripts/serve.sh
+    python3 tessera/tools/plan.py model.gguf --cpu-only --estimate  # no GPU: everything in RAM (and the SSD tier)
 
 The estimate is a bandwidth model, not a measurement: use it to compare options, then measure (scripts/bench.sh).
 Standard library only.
@@ -72,8 +73,15 @@ def mem_available_gib():
 
 
 def plan(info, vram_gib, ram_gib, ctx, ubatch, vram_reserve_gib, ram_reserve_gib):
-    """Byte budgets for each tier."""
+    """Byte budgets for each tier. vram_gib <= 0: CPU only, the dense part and the KV cache live in RAM too."""
     kv = kv_bytes(info, ctx)
+    if vram_gib <= 0:
+        compute = int(0.3 * GIB + ubatch * 0.3 * MIB)
+        ram = int(ram_gib * GIB) - int(ram_reserve_gib * GIB)
+        ram_experts = ram - info["embedding_bytes"] - info["dense_bytes"] - kv - compute
+        cache = 0 if info["expert_bytes"] <= ram_experts else max(0, ram_experts)
+        return {"kv": kv, "compute": compute, "hot": 0, "ram": ram, "cache": cache, "cpu_only": True,
+                "ram_experts": ram_experts}
     largest_expert_tensor = max(info["expert_bytes_per_layer_expert"].values() or [0]) * info["n_expert"] // 3
     # activations for a ubatch, plus one layer's expert tensor that prompt processing copies to the GPU
     compute = int(0.3 * GIB + ubatch * 0.6 * MIB + largest_expert_tensor)
@@ -84,7 +92,8 @@ def plan(info, vram_gib, ram_gib, ctx, ubatch, vram_reserve_gib, ram_reserve_gib
     ram_experts = ram - info["embedding_bytes"]
     # the CPU reads only the experts that are not hot, but prompt processing touches all of them
     cache = 0 if info["expert_bytes"] <= ram_experts else max(0, ram_experts)
-    return {"kv": kv, "compute": compute, "hot": hot, "ram": ram, "cache": cache}
+    return {"kv": kv, "compute": compute, "hot": hot, "ram": ram, "cache": cache, "cpu_only": False,
+            "ram_experts": ram_experts}
 
 
 def estimate(info, p, gpu_bw, ram_bw, ssd_bw, hit=None):
@@ -92,11 +101,22 @@ def estimate(info, p, gpu_bw, ram_bw, ssd_bw, hit=None):
     if not info["n_expert_used"] or not info["expert_bytes"]:
         return None
     per_tok = info["n_expert_used"] * info["moe_layers"] * info["expert_bytes_per_expert"]
+    cpu_bw = min(ram_bw * 0.6, 22.0) * 1e9    # what the CPU streams while computing quantized weights
+    if p["cpu_only"]:
+        cpu_ms = (info["dense_bytes"] + per_tok) / cpu_bw * 1e3
+        ssd_ms = 0.0
+        if p["cache"]:
+            in_ram = min(1.0, p["cache"] / info["expert_bytes"])
+            ssd_ms = per_tok * (1 - in_ram ** 0.35) / (ssd_bw * 1e9) * 1e3
+        overhead_ms = info["moe_layers"] * 0.02 + 1.0
+        ms = cpu_ms + ssd_ms + overhead_ms
+        return {"hit": 0.0, "gpu_ms": 0.0, "cpu_ms": cpu_ms, "ssd_ms": ssd_ms, "overhead_ms": overhead_ms,
+                "tok_s": 1000 / ms, "per_token_mib": per_tok / MIB}
     coverage = p["hot"] / info["expert_bytes"]
     # A static profile on real routing (Strata's measurements: 13% of the experts serve ~50% of the reads).
     h = hit if hit is not None else min(0.97, coverage ** 0.35) if coverage > 0 else 0.0
     gpu_ms = (info["dense_bytes"] + h * per_tok) / (gpu_bw * 0.5e9) * 1e3
-    cpu_ms = (1 - h) * per_tok / (min(ram_bw * 0.6, 22.0) * 1e9) * 1e3
+    cpu_ms = (1 - h) * per_tok / cpu_bw * 1e3
     ssd_ms = 0.0
     if p["cache"]:
         cold = info["expert_bytes"] - p["hot"]
@@ -112,6 +132,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model")
     ap.add_argument("--vram-gib", type=float, help="GPU memory (default: nvidia-smi)")
+    ap.add_argument("--cpu-only", action="store_true", help="plan without a GPU (same as --vram-gib 0)")
     ap.add_argument("--ram-gib", type=float, help="RAM available to the engine (default: MemAvailable now)")
     ap.add_argument("--ctx", type=int, default=32768, help="context tokens (default 32768)")
     ap.add_argument("--ubatch", type=int, default=1024, help="prompt micro-batch (default 1024)")
@@ -128,7 +149,7 @@ def main():
 
     info = model_info(args.model)
     gpu_name, vram = detect_gpu()
-    vram = args.vram_gib if args.vram_gib is not None else vram
+    vram = 0.0 if args.cpu_only else args.vram_gib if args.vram_gib is not None else vram
     ram = args.ram_gib if args.ram_gib is not None else mem_available_gib()
     p = plan(info, vram, ram, args.ctx, args.ubatch, args.vram_reserve_gib, args.ram_reserve_gib)
 
@@ -139,6 +160,32 @@ def main():
         return
     print(f"model  {os.path.basename(args.model)}: {info['file_bytes'] / GIB:.1f} GiB, {info['arch']}, "
           f"{info['n_expert']} experts x {info['moe_layers']} layers, {info['n_expert_used']} per token")
+    if p["cpu_only"]:
+        print(f"CPU only  |  RAM for the engine {ram:.1f} GiB")
+        print(f"RAM    dense {info['dense_bytes'] / GIB:.2f} + KV {p['kv'] / GIB:.2f} (ctx {args.ctx}) + embedding "
+              f"{info['embedding_bytes'] / GIB:.2f} + buffers {p['compute'] / GIB:.2f} GiB; experts "
+              f"{info['expert_bytes'] / GIB:.1f} GiB " + ("fit" if not p["cache"] else
+              f"do not fit: expert cache {p['cache'] / GIB:.1f} GiB, the rest from the SSD "
+              f"(--defer-experts --expert-cache {p['cache'] // MIB})"))
+        if p["ram_experts"] <= 0:
+            print("       the dense part and the KV cache alone do not fit: lower --ctx or pick a smaller quant")
+    else:
+        print_gpu_plan(info, p, gpu_name, vram, ram, args)
+    if args.estimate:
+        e = estimate(info, p, args.gpu_bw or gpu_bandwidth(gpu_name), args.ram_bw, args.ssd_bw, args.hit)
+        if e and p["cpu_only"]:
+            print(f"speed  ~{e['tok_s']:.0f} tok/s decode, no speculation (rough): CPU {e['cpu_ms']:.1f} ms"
+                  + (f" + SSD {e['ssd_ms']:.1f} ms" if e["ssd_ms"] else "")
+                  + f" + fixed {e['overhead_ms']:.1f} ms per token; {e['per_token_mib']:.0f} MiB of experts + "
+                  f"{info['dense_bytes'] / MIB:.0f} MiB dense per token")
+        elif e:
+            print(f"speed  ~{e['tok_s']:.0f} tok/s decode, no speculation (rough): VRAM hit {100 * e['hit']:.0f}%, "
+                  f"GPU {e['gpu_ms']:.1f} ms | CPU {e['cpu_ms']:.1f} ms"
+                  + (f" + SSD {e['ssd_ms']:.1f} ms" if e["ssd_ms"] else "")
+                  + f" | fixed {e['overhead_ms']:.1f} ms per token; {e['per_token_mib']:.0f} MiB of experts per token")
+
+
+def print_gpu_plan(info, p, gpu_name, vram, ram, args):
     print(f"GPU    {gpu_name or 'not detected'}, {vram:.1f} GiB  |  RAM for the engine {ram:.1f} GiB")
     print(f"VRAM   dense {info['dense_bytes'] / GIB:.2f} + KV {p['kv'] / GIB:.2f} (ctx {args.ctx}) + compute "
           f"{p['compute'] / GIB:.2f} + reserve {args.vram_reserve_gib:.1f} GiB  ->  hot experts {p['hot'] / GIB:.2f} GiB "
@@ -150,13 +197,6 @@ def main():
               f"(--defer-experts --expert-cache {p['cache'] // MIB})")
     else:
         print(f"RAM    all experts fit ({info['expert_bytes'] / GIB:.1f} of {p['ram'] / GIB:.1f} GiB): no SSD tier")
-    if args.estimate:
-        e = estimate(info, p, args.gpu_bw or gpu_bandwidth(gpu_name), args.ram_bw, args.ssd_bw, args.hit)
-        if e:
-            print(f"speed  ~{e['tok_s']:.0f} tok/s decode, no speculation (rough): VRAM hit {100 * e['hit']:.0f}%, "
-                  f"GPU {e['gpu_ms']:.1f} ms | CPU {e['cpu_ms']:.1f} ms"
-                  + (f" + SSD {e['ssd_ms']:.1f} ms" if e["ssd_ms"] else "")
-                  + f" | fixed {e['overhead_ms']:.1f} ms per token; {e['per_token_mib']:.0f} MiB of experts per token")
 
 
 if __name__ == "__main__":

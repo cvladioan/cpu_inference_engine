@@ -61,4 +61,18 @@ nvidia_smi() {
 
 is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
 
+# 1 when the model runs on the CPU alone: CPU_ONLY=1, or (auto) the engine was built without CUDA or no NVIDIA
+# GPU is visible. Then everything lives in RAM (and the SSD tier), and there are no hot experts.
+cpu_only_mode() {
+    case "${CPU_ONLY:-auto}" in
+        1|yes|true) echo 1; return ;;
+        0|no|false) echo 0; return ;;
+    esac
+    if grep -q '^GGML_CUDA:BOOL=ON' "$ENGINE_DIR/build/CMakeCache.txt" 2>/dev/null && nvidia_smi -L >/dev/null 2>&1; then
+        echo 0
+    else
+        echo 1
+    fi
+}
+
 python() { if [[ -x "$VENV/bin/python" ]]; then "$VENV/bin/python" "$@"; else python3 "$@"; fi; }

@@ -70,6 +70,36 @@ scripts/bench.sh --modes hot --threads 6,8,10
 To use a model you already have, set `MODEL_FILE=/path/to/model.gguf` in `tessera.env` (the first shard of a split
 model).
 
+## CPU only
+
+With no GPU, set `CPU_ONLY=1` in `tessera.env`, or leave it on `auto`, which switches on by itself when the engine
+was built without CUDA or no NVIDIA GPU is visible. Then:
+- `setup-wsl.sh` skips the GPU check and the CUDA toolkit;
+- `build.sh` builds for the CPU (about 10 minutes);
+- `calibrate.sh` has nothing to do (the profile only chooses what goes to VRAM);
+- `serve.sh` keeps everything in RAM, and turns on the SSD tier when the model does not fit.
+
+```bash
+CPU_ONLY=1 scripts/setup-wsl.sh
+CPU_ONLY=1 scripts/build.sh
+tests/run_tests.sh
+scripts/serve.sh --plan        # shows "CPU only", the RAM plan and the estimate
+scripts/serve.sh
+scripts/bench.sh --modes cpu --threads 6,8,10
+```
+
+Expect about a sixth of the GPU speed on this PC. The CPU reads the dense part and every expert from RAM at about
+40 GB/s, where the GPU reads its share at 504 GB/s. Rough estimates for the target PC (`tools/plan.py --cpu-only`):
+
+| Model | CPU only | With the GPU |
+|---|---|---|
+| gpt-oss-20b, Qwen3.6-35B-A3B Q4_K_M (fit in RAM) | ~10-15 tok/s | ~70 tok/s |
+| Qwen3.6-35B-A3B Q6_K, Qwen3-Next-80B-A3B Q3_K_XL (larger than RAM: SSD tier) | ~5 tok/s | 30-50 tok/s |
+| a dense 27-32B model at 4 bits | ~2 tok/s | ~2-4 tok/s |
+
+For CPU-only servers with more memory channels (the original goal of this repository), use
+[`../deploy/`](../deploy/README.md). It adds NUMA placement and a systemd service.
+
 ## How it works
 
 ```

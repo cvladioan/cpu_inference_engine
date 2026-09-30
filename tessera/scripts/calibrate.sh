@@ -13,6 +13,10 @@ load_config
 
 model=$(resolve_model)
 profile=$(resolve_profile "$model")
+if (( $(cpu_only_mode) )); then
+    log "CPU only: the profile chooses the experts kept in VRAM, so there is nothing to calibrate without a GPU"
+    exit 0
+fi
 prompts=${PROMPTS:-$TESSERA_DIR/prompts/calibration.txt}
 tokens=${TOKENS:-160}
 port=${CALIBRATE_PORT:-18181}
