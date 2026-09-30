@@ -103,6 +103,50 @@ Expect about a sixth of the GPU speed on this PC. The CPU reads the dense part a
 For CPU-only servers with more memory channels (the original goal of this repository), use
 [`../deploy/`](../deploy/README.md). It adds NUMA placement and a systemd service.
 
+## Use it from a coding agent (pi)
+
+Any client of the OpenAI API works. `serve.sh` passes `--jinja`, which tool calls need.
+
+To use [pi](https://github.com/badlogic/pi-mono) from another machine:
+
+1. **Reach the server through an SSH tunnel.** The server can then stay on `127.0.0.1` with no key:
+
+   ```bash
+   ssh -N -L 18080:127.0.0.1:8080 user@server
+   ```
+
+2. **Add the endpoint** to `~/.pi/agent/models.json` (on Windows, `%USERPROFILE%\.pi\agent\models.json`):
+
+   ```json
+   {
+     "providers": {
+       "tessera": {
+         "baseUrl": "http://127.0.0.1:18080/v1",
+         "api": "openai-completions",
+         "apiKey": "none",
+         "models": [
+           { "id": "local", "name": "Tessera", "contextWindow": 32768, "maxTokens": 8192, "reasoning": false }
+         ]
+       }
+     }
+   }
+   ```
+
+   - `contextWindow` is `CTX`.
+   - Set `"reasoning": true` for a thinking model.
+
+3. **Choose the model** with `/model` in pi.
+
+**Speed:**
+- The first request processes pi's system prompt and tool definitions (a few thousand tokens) at prompt speed. On a CPU that takes up to a minute.
+- Later turns reuse the server's prompt cache, so only the new messages are processed.
+- ik_llama.cpp keeps context checkpoints by default (`--ctx-checkpoints 32`). Hybrid models such as Qwen3-Next need them to reuse that cache.
+
+**Native Windows:**
+- Run pi from PowerShell or Windows Terminal.
+- MobaXterm's local shell turns npm's launcher path into `C:\drives\c\...`, so pi fails there with `Cannot find module`.
+- pi runs its `bash` tool through Git Bash.
+
 ## How it works
 
 ```
